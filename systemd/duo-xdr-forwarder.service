@@ -1,0 +1,40 @@
+[Unit]
+Description=Duo Log Sync → Cortex XDR HTTP Log Collector Forwarder
+Documentation=https://github.com/your-org/duo-log-sync-http-collector-xdr
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=duo-xdr-forwarder
+Group=duo-xdr-forwarder
+
+# Script and environment
+WorkingDirectory=/opt/duo-xdr-forwarder
+ExecStart=/opt/duo-xdr-forwarder/.venv/bin/python3 /opt/duo-xdr-forwarder/duo_xdr_forwarder.py
+EnvironmentFile=/opt/duo-xdr-forwarder/.env
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+
+# Logging — output goes to the systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=duo-xdr-forwarder
+
+# Hardening
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+# No ReadWritePaths needed — no local state file in TCP listener mode
+
+# Resource limits — prevent unbounded memory/thread growth from queue or connection storms
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

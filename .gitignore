@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+# DLS is a runtime dependency, not part of this repo
+duo_log_sync/
