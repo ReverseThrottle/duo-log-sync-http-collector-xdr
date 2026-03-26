@@ -17,7 +17,6 @@ A lightweight, production-ready bridge that forwards **Duo Security authenticati
 9. [Security Model](#security-model)
 10. [Operational Behavior](#operational-behavior)
 11. [Troubleshooting](#troubleshooting)
-12. [Security Review Summary](#security-review-summary)
 
 ---
 
@@ -493,38 +492,3 @@ C:\ProgramData\duo-xdr-forwarder\logs\stdout.log
 C:\ProgramData\duo-xdr-forwarder\logs\stderr.log
 ```
 
----
-
-## Security Review Summary
-
-This codebase was reviewed for security and reliability issues prior to release. The following categories of issues were identified and addressed:
-
-### Addressed before release
-
-| Severity | Issue | Resolution |
-|---|---|---|
-| High | No HTTPS enforcement — HTTP URLs would expose API key in transit | Startup validation rejects any non-HTTPS URL with `sys.exit(1)` |
-| High | Unbounded TCP receive buffer — malformed connection could exhaust memory | 1 MB buffer cap per connection; connection closed if exceeded |
-| High | Unbounded record queue — XDR outage could exhaust memory | Queue capped at 200× `BATCH_SIZE`; records dropped with WARNING when full |
-| High | Listener thread death invisible to main process — silent failure | Main thread monitors listener thread; shuts down cleanly if it dies |
-| Medium | Non-loopback bind address not warned | Warning logged at startup if `LISTEN_HOST` is not a loopback address |
-| Medium | JSON parse error logged raw line content — potential PII exposure | Parse errors log byte count only, never log record content |
-| Medium | `BATCH_SIZE=0` caused sender loop to spin and never send | Validated ≥ 1 at startup |
-| Medium | Invalid `LISTEN_PORT` silently killed listener thread | Validated 1–65535 at startup |
-| Medium | `LOG_LEVEL` accepted arbitrary logging module attributes | Validated against known level names at startup |
-| Medium | Windows: NSSM stores secrets in Registry plaintext | Documented clearly in installer output and this README |
-| Low | Timestamps not range-checked — already-millisecond values sent as seconds would be far in the future | ±5-year sanity check applied; out-of-range timestamps fall back to ingestion time |
-| Low | `StartLimitIntervalSec` placed in wrong systemd unit section | Moved to `[Unit]` section |
-| Low | systemd unit had no memory or task limits | `MemoryMax=512M` and `TasksMax=64` added |
-| Low | `requirements.txt` had no upper version bounds | Pinned to major version ranges |
-| Low | PowerShell installer had no guard for dot-source invocation | `$MyInvocation.MyCommand.Path` null guard added |
-| Low | PowerShell uninstall had no wait between stop and remove | Polls service status before issuing remove |
-
-### Known limitations / accepted risks
-
-| Item | Notes |
-|---|---|
-| Best-effort delivery to XDR | Records that fail all retry attempts are discarded. DLS checkpoints prevent re-sending from Duo, so these records are permanently lost. Alert on `ERROR` level log messages to detect this condition. |
-| In-memory queue only | There is no persistent write-ahead log between DLS and XDR. A process crash after DLS delivers records but before XDR accepts them will result in those records being lost. DLS's own checkpoint means it will not re-deliver them. |
-| Plaintext TCP between DLS and forwarder | Acceptable because the connection is loopback-only by default. If your deployment requires DLS and the forwarder to run on different hosts, configure DLS with `TCPSSL` protocol and update the forwarder to use `ssl.wrap_socket`. |
-| No authentication on TCP listener | Any process on the local host that can connect to `LISTEN_HOST:LISTEN_PORT` can inject records. Mitigate with OS-level firewall rules restricting the port to the DLS process user, or by running DLS and the forwarder as the same OS user. |
