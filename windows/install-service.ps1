@@ -133,7 +133,7 @@ if ($Action -eq "uninstall") {
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-Write-Host "=== Duo XDR Forwarder — Windows Service Installer ==="
+Write-Host "=== Duo XDR Forwarder - Windows Service Installer ==="
 Write-Host ""
 
 # Validate files
