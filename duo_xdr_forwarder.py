@@ -132,14 +132,19 @@ def enrich_record(record: dict, dataset: str) -> dict:
 # HTTP sending
 # ---------------------------------------------------------------------------
 
-def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff: float) -> bool:
+def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff: float,
+               session: requests.Session = None) -> bool:
     """
     POST a batch of enriched records to XDR as NDJSON.
 
     Retries on 429, 5xx, and network errors with exponential backoff.
     Returns True on 2xx success, False on permanent failure.
+
+    Pass a requests.Session to reuse the underlying TLS connection across batches
+    (P1: avoids a fresh handshake on every POST).
     """
     body = "\n".join(json.dumps(r) for r in records)
+    http = session if session is not None else requests
     attempt = 0
     while attempt <= max_retries:
         if attempt > 0:
@@ -148,7 +153,7 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
             time.sleep(wait)
         attempt += 1
         try:
-            resp = requests.post(url, data=body, headers=headers, timeout=30)
+            resp = http.post(url, data=body, headers=headers, timeout=30)
             if 200 <= resp.status_code < 300:
                 logging.debug("Batch of %d records accepted (HTTP %d)", len(records), resp.status_code)
                 return True
@@ -186,7 +191,9 @@ def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queu
     """
     peer = f"{addr[0]}:{addr[1]}"
     logging.info("DLS connected: %s", peer)
-    buf = b""
+    # P2: bytearray supports in-place extend() — avoids a full copy on every recv()
+    # that bytes += would cause (bytes is immutable, so += always allocates + copies).
+    buf = bytearray()
     try:
         conn.settimeout(5.0)
         while not shutdown_event.is_set():
@@ -197,16 +204,22 @@ def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queu
             if not data:
                 logging.info("DLS disconnected: %s", peer)
                 break
-            buf += data
+            buf.extend(data)
             if len(buf) > _MAX_BUF_BYTES:
                 logging.error(
                     "Receive buffer exceeded %d bytes on connection %s — closing connection",
                     _MAX_BUF_BYTES, peer,
                 )
                 break
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                line = line.strip()
+            # P3: find() locates the delimiter once per line instead of the O(n^2)
+            # pattern of "in" membership test + split() on every iteration.
+            # del buf[:idx+1] removes consumed bytes in-place (no extra allocation).
+            while True:
+                idx = buf.find(b"\n")
+                if idx == -1:
+                    break
+                line = bytes(buf[:idx]).strip()
+                del buf[:idx + 1]
                 if not line:
                     continue
                 try:
@@ -303,6 +316,9 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     }
     if config["api_key_id"]:
         headers["x-xdr-auth-id"] = str(config["api_key_id"])
+    # P1: reuse a single TLS connection across all batch POSTs rather than
+    # opening and tearing down a new connection on every flush interval.
+    session = requests.Session()
     batch = []
     last_flush = time.monotonic()
 
@@ -327,7 +343,7 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
                     break
 
         if batch:
-            ok = send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"])
+            ok = send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"], session)
             if ok:
                 logging.info("Sent %d records to XDR", len(batch))
                 batch = []
@@ -343,7 +359,7 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     # Final flush on shutdown
     if batch:
         logging.info("Flushing %d remaining records on shutdown", len(batch))
-        send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"])
+        send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"], session)
 
 
 # ---------------------------------------------------------------------------
