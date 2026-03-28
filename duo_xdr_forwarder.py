@@ -71,6 +71,11 @@ def load_config() -> dict:
         print(f"ERROR: BATCH_SIZE must be >= 1, got: {batch_size}", file=sys.stderr)
         sys.exit(1)
 
+    max_connections = _int("MAX_CONNECTIONS", 10)
+    if max_connections < 1:
+        print(f"ERROR: MAX_CONNECTIONS must be >= 1, got: {max_connections}", file=sys.stderr)
+        sys.exit(1)
+
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     if log_level not in valid_levels:
@@ -85,6 +90,7 @@ def load_config() -> dict:
         "listen_host": os.environ.get("LISTEN_HOST", "127.0.0.1"),
         "listen_port": listen_port,
         "batch_size": batch_size,
+        "max_connections": max_connections,
         "flush_interval": _float("FLUSH_INTERVAL_SECONDS", 5),
         "log_level": log_level,
         "max_retries": _int("MAX_RETRIES", 3),
@@ -172,7 +178,7 @@ _MAX_BUF_BYTES = 1 * 1024 * 1024  # 1 MB
 # TCP connection handler (one thread per DLS connection)
 # ---------------------------------------------------------------------------
 
-def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queue, shutdown_event: threading.Event):
+def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queue, shutdown_event: threading.Event, conn_sem: threading.Semaphore = None):
     """
     Read newline-delimited JSON from a single DLS TCP connection.
     Each complete line is parsed and pushed onto record_queue.
@@ -214,6 +220,8 @@ def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queu
     except Exception as e:
         logging.error("Unexpected error on connection %s: %s", peer, e)
     finally:
+        if conn_sem is not None:
+            conn_sem.release()
         try:
             conn.close()
         except OSError:
@@ -231,13 +239,15 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
     """
     host = config["listen_host"]
     port = config["listen_port"]
+    max_conn = config["max_connections"]
+    conn_sem = threading.Semaphore(max_conn)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(16)
         server.settimeout(1.0)
-        logging.info("Listening for DLS connections on %s:%d", host, port)
+        logging.info("Listening for DLS connections on %s:%d (max %d concurrent)", host, port, max_conn)
         try:
             if not ipaddress.ip_address(host).is_loopback:
                 logging.warning(
@@ -252,9 +262,21 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
                 conn, addr = server.accept()
             except socket.timeout:
                 continue
+
+            if not conn_sem.acquire(blocking=False):
+                logging.warning(
+                    "Connection limit (%d) reached — rejecting connection from %s:%s",
+                    max_conn, addr[0], addr[1],
+                )
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+
             t = threading.Thread(
                 target=handle_connection,
-                args=(conn, addr, record_queue, shutdown_event),
+                args=(conn, addr, record_queue, shutdown_event, conn_sem),
                 daemon=True,
             )
             t.start()
@@ -332,7 +354,10 @@ _shutdown_event = threading.Event()
 
 
 def _handle_signal(signum, frame):
-    logging.info("Signal %d received — shutting down after current batch", signum)
+    # Set the event only — do NOT call logging here.
+    # logging acquires a lock; calling it from a signal handler risks deadlock
+    # if the lock is already held by the interrupted thread.
+    # The main thread logs the shutdown message after returning from the event wait.
     _shutdown_event.set()
 
 
@@ -351,6 +376,16 @@ def main():
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+    # On Windows, SIGTERM is defined but its handler is never invoked — it is not a real
+    # OS signal. NSSM stops processes by sending GenerateConsoleCtrlEvent: first
+    # CTRL_C (SIGINT), then CTRL_BREAK (SIGBREAK) if the process is still running.
+    # Registering SIGBREAK ensures the graceful shutdown path (including final flush)
+    # is reached even when SIGINT is not delivered (e.g. no console attached).
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, _handle_signal)
+
+    _sigbreak_note = ', SIGBREAK' if hasattr(signal, 'SIGBREAK') else ''
+    logging.info("Signal handlers registered (SIGTERM, SIGINT%s)", _sigbreak_note)
 
     logging.info(
         "Starting duo-xdr-forwarder: listen=%s:%d dataset=%s batch_size=%d flush_interval=%ss",
@@ -383,7 +418,7 @@ def main():
         logging.exception("Unhandled exception in sender loop")
         _shutdown_event.set()
 
-    logging.info("Shutdown complete")
+    logging.info("Shutdown signal received — shutdown complete")
     sys.exit(0)
 
 
