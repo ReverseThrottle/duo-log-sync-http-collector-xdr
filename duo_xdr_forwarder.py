@@ -266,13 +266,16 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
     conn_sem = threading.Semaphore(max_conn)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # On Windows, SO_REUSEADDR alone does NOT prevent a second process from
-        # binding the same port — it only recycles TIME_WAIT sockets. Use
-        # SO_EXCLUSIVEADDRUSE to make a conflicting bind() fail immediately with
-        # a clear WinError 10048, so dual-instance startup is caught early.
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_EXCLUSIVEADDRUSE prevents any other process from binding
+            # the same port (SO_REUSEADDR does NOT guarantee this on Windows).
+            # SO_EXCLUSIVEADDRUSE also recycles TIME_WAIT sockets on Vista+, so
+            # SO_REUSEADDR is redundant and is omitted to avoid confusion.
             server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # POSIX: SO_REUSEADDR recycles TIME_WAIT sockets without allowing
+            # another process to steal the port.
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             server.bind((host, port))
         except OSError as e:

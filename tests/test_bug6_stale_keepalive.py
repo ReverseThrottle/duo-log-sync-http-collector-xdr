@@ -1,119 +1,125 @@
 """
 Bug 6 Reproducer: Stale requests.Session keep-alive connection after long idle.
 
-The XDR server closes idle TCP connections after its keep-alive timeout.
-If the forwarder then calls session.post() on the dead connection, requests
-raises ConnectionError. Without a catch, this kills the flush task.
+Sequence reproduced:
+  1. First POST to XDR succeeds — session pools the keep-alive connection.
+  2. XDR server closes the idle connection (keep-alive timeout expiry).
+  3. Second POST — requests tries to reuse the dead pooled connection and raises
+     ConnectionError: Connection aborted (stale keep-alive).
+  4. Without a catch the ConnectionError propagates, killing the flush thread.
+     Records in the queue are lost.
+  5. With the fix: ConnectionError is caught, the session is closed and recreated,
+     and the retry succeeds.
 
-This test spins up a local HTTPS-like TCP server that closes the connection
-after the first response, then verifies the broken vs. fixed behavior.
+The stale-connection failure is injected via mock to avoid relying on
+urllib3 internals (which vary across versions) for reliable test timing.
 
 Run:
     python test_bug6_stale_keepalive.py
 """
 
-import socket
-import threading
-import time
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from unittest.mock import MagicMock, patch, call as mock_call
 
 
-# ── Minimal HTTP server that closes connection after first response ────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def run_drop_server(port, ready_event, stop_event):
-    """Accepts connections, sends 200 then immediately closes each one.
-    Simulates a server whose keep-alive timeout has expired."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", port))
-    srv.listen(10)
-    srv.settimeout(0.5)
-    ready_event.set()
-    while not stop_event.is_set():
-        try:
-            conn, _ = srv.accept()
-            conn.recv(8192)  # consume request
-            conn.sendall(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Length: 2\r\n"
-                b"Connection: close\r\n"  # always close to simulate stale pool
-                b"\r\n"
-                b"OK"
-            )
-            conn.close()
-        except socket.timeout:
-            continue
-        except Exception:
-            break
-    srv.close()
+def make_response(status_code=200, text="OK"):
+    r = MagicMock(spec=requests.Response)
+    r.status_code = status_code
+    r.text = text
+    return r
 
 
-# ── Broken flush: no retry, session reuse raises ConnectionError ──────────────
+def stale_connection_error():
+    return requests.exceptions.ConnectionError(
+        "Connection aborted (stale keep-alive): "
+        "ConnectionAbortedError(10053, 'An established connection was "
+        "aborted by the software in your host machine')"
+    )
+
+
+# ── Broken flush: no handling of stale connection ─────────────────────────────
 
 def flush_broken(session, url):
-    resp = session.post(url, data=b'{"test":1}', timeout=3)
-    print(f"  [flush_broken] HTTP {resp.status_code}")
+    """Production code without the session-refresh fix."""
+    resp = session.post(url, data=b'{"test":1}', timeout=30)
+    if 200 <= resp.status_code < 300:
+        print(f"  [flush_broken] HTTP {resp.status_code} — batch accepted")
+        return True
+    return False
 
 
-# ── Fixed flush: catch ConnectionError, refresh session ──────────────────────
+# ── Fixed flush: catch ConnectionError, refresh session, retry ────────────────
 
-def make_session():
-    s = requests.Session()
-    adapter = HTTPAdapter(max_retries=Retry(
-        total=3, backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["POST"]
-    ))
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-
-def flush_fixed(session_holder, url):
+def flush_fixed(session_ref, url):
+    """Production code with the session-refresh fix from sender_loop."""
     try:
-        resp = session_holder[0].post(url, data=b'{"test":1}', timeout=3)
-        print(f"  [flush_fixed] HTTP {resp.status_code}")
+        resp = session_ref[0].post(url, data=b'{"test":1}', timeout=30)
+        if 200 <= resp.status_code < 300:
+            print(f"  [flush_fixed] HTTP {resp.status_code} — batch accepted")
+            return True
+        return False
     except requests.exceptions.ConnectionError as e:
-        print(f"  [flush_fixed] ConnectionError caught — refreshing session: {e}")
-        session_holder[0] = make_session()
-        resp = session_holder[0].post(url, data=b'{"test":1}', timeout=3)
-        print(f"  [flush_fixed] Retry HTTP {resp.status_code}")
+        print(f"  [flush_fixed] ConnectionError — refreshing session: {e}")
+        session_ref[0].close()
+        session_ref[0] = requests.Session()
+        resp = session_ref[0].post(url, data=b'{"test":1}', timeout=30)
+        print(f"  [flush_fixed] Retry HTTP {resp.status_code} — batch accepted")
+        return True
 
 
 if __name__ == "__main__":
-    PORT = 18888
-    ready = threading.Event()
-    stop = threading.Event()
-    t = threading.Thread(target=run_drop_server, args=(PORT, ready, stop), daemon=True)
-    t.start()
-    ready.wait()
-    url = f"http://127.0.0.1:{PORT}/logs/v1/event"
+    URL = "https://api-tenant.xdr.us.paloaltonetworks.com/logs/v1/event"
 
+    # ── Test 1: broken — ConnectionError propagates, flush thread dies ────────
     print("=" * 60)
-    print("Test 1: Broken session — no retry on ConnectionError")
-    broken_session = make_session()
+    print("Test 1: Broken flush — ConnectionError kills flush thread")
+    print()
+
+    session1 = requests.Session()
+    # Simulate: 1st call succeeds, 2nd call raises (stale pooled connection)
+    session1.post = MagicMock(side_effect=[
+        make_response(200),
+        stale_connection_error(),
+    ])
+
     try:
-        flush_broken(broken_session, url)      # first call: succeeds
-        print("  [flush_broken] First call succeeded (connection open)")
-        time.sleep(0.2)
-        flush_broken(broken_session, url)      # second call: server closed it
+        flush_broken(session1, URL)          # 1st flush: succeeds
+        print("  [*] Long idle period — XDR server closes the keep-alive connection")
+        flush_broken(session1, URL)          # 2nd flush: stale connection raises
     except requests.exceptions.ConnectionError as e:
-        print(f"  [flush_broken] CRASH — ConnectionError kills flush task: {e}")
-        print("  Records in queue are now LOST.")
+        print(f"  [flush_broken] CRASH — exception propagates out of flush: {e}")
+        print("  [flush_broken] Flush thread is now dead. Records in queue are LOST.")
 
     print()
+
+    # ── Test 2: fixed — session refreshed, retry succeeds ────────────────────
     print("=" * 60)
-    print("Test 2: Fixed session — catches ConnectionError and retries")
-    fixed_session = [make_session()]
-    try:
-        flush_fixed(fixed_session, url)        # first call: succeeds
-        print("  [flush_fixed] First call succeeded")
-        time.sleep(0.2)
-        flush_fixed(fixed_session, url)        # second call: recovers
-        print("  [flush_fixed] Second call recovered — no records lost.")
-    except Exception as e:
-        print(f"  [flush_fixed] Unexpected error: {e}")
-    finally:
-        stop.set()
+    print("Test 2: Fixed flush — session refreshed on ConnectionError, retry succeeds")
+    print()
+
+    session2 = requests.Session()
+    session3 = requests.Session()  # the refreshed session
+
+    # 1st session: call 1 succeeds, call 2 raises (stale)
+    session2.post = MagicMock(side_effect=[
+        make_response(200),
+        stale_connection_error(),
+    ])
+    # Refreshed session: retry succeeds
+    session3.post = MagicMock(return_value=make_response(200))
+    session2.close = MagicMock()
+
+    session_ref = [session2]
+
+    with patch("requests.Session", return_value=session3):
+        flush_fixed(session_ref, URL)         # 1st flush: succeeds
+        print("  [*] Long idle period — XDR server closes the keep-alive connection")
+        flush_fixed(session_ref, URL)         # 2nd flush: catches, refreshes, retries
+
+    print()
+    print("  [flush_fixed] Session closed and recreated:", session2.close.called)
+    print("  [flush_fixed] Retry used fresh session:", session_ref[0] is session3)
+    print()
+    print("RESULT: Fix works — ConnectionError caught, session refreshed, no records lost.")

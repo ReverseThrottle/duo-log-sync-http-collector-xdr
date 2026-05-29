@@ -1,182 +1,191 @@
 """
-Bug 1 Reproducer: Silent asyncio task death on Windows ProactorEventLoop.
+Bug 1 Reproducer: Silent flush-thread death.
 
-Demonstrates how an unhandled exception inside an asyncio Task is silently
-swallowed on Windows, leaving the server socket alive but the flush worker dead.
+The production forwarder uses threads, not asyncio. This test demonstrates
+the thread-based failure mode: an unhandled exception in the flush worker
+thread kills it silently while the TCP listener thread keeps accepting DLS
+connections. Records accumulate in the queue but are never forwarded to XDR —
+matching the 2.5-day dead period seen in the customer logs (May 15-18).
 
-Run on Windows as:
-    python test_bug1_silent_task_death.py
-
-Expected output WITHOUT fix:
-    [SERVER] Listening on 127.0.0.1:9999
-    [SERVER] DLS connected
-    [SERVER] DLS disconnected
-    [SERVER] Flush worker DIED silently (no log output from worker after this)
-    [CLIENT] Sent 1 record
-    [CLIENT] Sent 1 record       <-- server still accepts but never flushes
-
-Expected output WITH fix (--fix flag):
-    ... all flushes succeed ...
+Run:
+    python test_bug1_silent_task_death.py           # bug: 0 records forwarded
+    python test_bug1_silent_task_death.py --fix     # fix: all records forwarded
 """
 
-import asyncio
-import json
-import sys
-import time
-import threading
 import argparse
+import json
+import queue
+import socket
+import sys
+import threading
+import time
 
 HOST = "127.0.0.1"
 PORT = 19999  # avoid conflict with real service
 
-record_queue = asyncio.Queue()
-flush_count = 0
 APPLY_FIX = False
+record_queue: queue.Queue = queue.Queue(maxsize=1000)
+flush_count = 0
+shutdown = threading.Event()
+flush_alive_before_shutdown = True  # updated by run_client() before setting shutdown
 
 
-# ── Broken flush worker (no exception guard) ──────────────────────────────────
+# ── Broken flush thread (no exception guard) ──────────────────────────────────
 
-async def flush_worker_broken():
-    """Simulates the buggy flush loop that dies silently on first error."""
+def flush_worker_broken():
+    """
+    Simulates the buggy flush loop. On the first batch it raises AttributeError
+    (the resp.status.code bug). The exception propagates out of the thread
+    function, killing the thread. Python prints the traceback to stderr but the
+    TCP listener keeps running — callers see DLS connected/disconnected in the
+    log but 'Sent X records' never appears again.
+    """
     global flush_count
     call_count = 0
-    while True:
-        await asyncio.sleep(0.5)
+    while not shutdown.is_set():
+        time.sleep(0.5)
         batch = []
-        while not record_queue.empty():
-            batch.append(await record_queue.get())
+        while True:
+            try:
+                batch.append(record_queue.get_nowait())
+            except queue.Empty:
+                break
         if batch:
             call_count += 1
             if call_count == 1:
-                # Simulate what happens on first XDR 4xx: resp.status.code raises
-                # AttributeError which propagates uncaught out of the task.
+                # resp.status.code raises AttributeError — propagates uncaught,
+                # thread exits, flush is dead for the lifetime of the process.
                 raise AttributeError("'int' object has no attribute 'code'")
             flush_count += len(batch)
             print(f"[FLUSH] Sent {len(batch)} records (total={flush_count})")
 
 
-# ── Fixed flush worker (exception guard keeps it alive) ───────────────────────
+# ── Fixed flush thread (exception guard keeps it alive) ───────────────────────
 
-async def flush_worker_fixed():
-    """Flush loop that survives exceptions."""
+def flush_worker_fixed():
+    """Flush loop that survives exceptions — the loop never exits on error."""
     global flush_count
-    while True:
+    while not shutdown.is_set():
         try:
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
             batch = []
-            while not record_queue.empty():
-                batch.append(await record_queue.get())
+            while True:
+                try:
+                    batch.append(record_queue.get_nowait())
+                except queue.Empty:
+                    break
             if batch:
-                # Simulate resp.status.code bug but catch it
                 try:
                     raise AttributeError("'int' object has no attribute 'code'")
                 except AttributeError as e:
-                    print(f"[FLUSH] AttributeError caught, using status_code instead: {e}")
+                    print(f"[FLUSH] AttributeError caught (use status_code): {e}")
                 flush_count += len(batch)
                 print(f"[FLUSH] Sent {len(batch)} records (total={flush_count})")
         except Exception as e:
             print(f"[FLUSH] Error (loop continues): {e}")
 
 
-# ── DLS connection handler ─────────────────────────────────────────────────────
+# ── TCP connection handler ─────────────────────────────────────────────────────
 
-async def handle_dls(reader, writer):
-    peer = writer.get_extra_info("peername")
+def handle_connection(conn: socket.socket, addr: tuple):
+    peer = f"{addr[0]}:{addr[1]}"
     print(f"[SERVER] DLS connected: {peer}")
     buf = b""
     try:
-        while True:
-            chunk = await reader.read(4096)
-            if not chunk:
+        conn.settimeout(2.0)
+        while not shutdown.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            if not data:
                 break
-            buf += chunk
+            buf += data
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 if line.strip():
-                    record = json.loads(line)
-                    await record_queue.put(record)
+                    try:
+                        record_queue.put_nowait(json.loads(line))
+                    except queue.Full:
+                        pass
     except Exception as e:
         print(f"[SERVER] Handler error: {e}")
     finally:
         print(f"[SERVER] DLS disconnected: {peer}")
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+        conn.close()
 
 
-async def server_main():
-    loop = asyncio.get_event_loop()
-    policy_name = type(loop).__name__
+# ── TCP listener thread ────────────────────────────────────────────────────────
 
-    print(f"[SERVER] Event loop: {policy_name}")
-    print(f"[SERVER] Listening on {HOST}:{PORT}")
-    print(f"[SERVER] Fix applied: {APPLY_FIX}")
-    print()
+def tcp_listener():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((HOST, PORT))
+        srv.listen(5)
+        srv.settimeout(1.0)
+        print(f"[SERVER] Listening on {HOST}:{PORT}")
+        while not shutdown.is_set():
+            try:
+                conn, addr = srv.accept()
+                threading.Thread(
+                    target=handle_connection, args=(conn, addr), daemon=True
+                ).start()
+            except socket.timeout:
+                continue
 
-    server = await asyncio.start_server(handle_dls, HOST, PORT)
 
-    if APPLY_FIX:
-        worker = asyncio.create_task(flush_worker_fixed())
-    else:
-        worker = asyncio.create_task(flush_worker_broken())
-
-    # Monitor the task after 2s, then shut down after 10s total
-    async def monitor_and_stop():
-        await asyncio.sleep(2)
-        if worker.done():
-            exc = worker.exception() if not worker.cancelled() else None
-            print(f"[SERVER] !! Flush worker DIED. Exception: {exc}")
-            print(f"[SERVER] !! Server socket still alive but flush is dead.")
-        else:
-            print(f"[SERVER] Flush worker still running (good).")
-        await asyncio.sleep(8)
-        server.close()
-
-    asyncio.create_task(monitor_and_stop())
-
-    async with server:
-        await server.serve_forever()
-
+# ── Test client ────────────────────────────────────────────────────────────────
 
 def run_client():
-    """Send 3 fake DLS log records in separate connections, 1 second apart."""
-    import socket, time
-    time.sleep(0.5)  # let server start
+    time.sleep(0.5)  # let listener bind
     for i in range(3):
         time.sleep(1.5)
         try:
             with socket.create_connection((HOST, PORT), timeout=5) as s:
                 record = json.dumps({"event": f"auth_{i}", "user": "test@example.com"})
                 s.sendall((record + "\n").encode())
-                time.sleep(0.2)
-            print(f"[CLIENT] Sent record {i+1}")
+                time.sleep(0.1)
+            print(f"[CLIENT] Sent record {i + 1}")
         except Exception as e:
             print(f"[CLIENT] Error: {e}")
     time.sleep(1)
+    # Check liveness BEFORE signalling shutdown so a clean exit of the fixed
+    # worker (which also stops when shutdown is set) isn't misread as a crash.
+    global flush_alive_before_shutdown
+    flush_alive_before_shutdown = flush_thread.is_alive()
+    shutdown.set()
+
     print(f"[CLIENT] Done. Total records flushed to XDR: {flush_count}")
     print()
     if not APPLY_FIX and flush_count == 0:
-        print("RESULT: BUG REPRODUCED — flush worker died, 0 records forwarded")
+        print("RESULT: BUG REPRODUCED — flush thread died, 0 records forwarded")
     elif APPLY_FIX and flush_count > 0:
         print("RESULT: FIX WORKS — all records forwarded despite AttributeError")
+    else:
+        print(f"RESULT: unexpected state (fix={APPLY_FIX}, flushed={flush_count})")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fix", action="store_true", help="Apply the fix")
+    parser.add_argument("--fix", action="store_true", help="Apply the exception guard fix")
     args = parser.parse_args()
     APPLY_FIX = args.fix
 
-    if sys.platform == "win32" and APPLY_FIX:
-        # Fix: use SelectorEventLoop which handles exceptions more predictably
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    print(f"[SERVER] Fix applied: {APPLY_FIX}")
+    print()
 
-    client_thread = threading.Thread(target=run_client, daemon=True)
+    listener_thread = threading.Thread(target=tcp_listener, daemon=True, name="tcp-listener")
+    listener_thread.start()
+
+    worker_fn = flush_worker_fixed if APPLY_FIX else flush_worker_broken
+    flush_thread = threading.Thread(target=worker_fn, daemon=True, name="flush-worker")
+    flush_thread.start()
+
+    client_thread = threading.Thread(target=run_client)
     client_thread.start()
+    client_thread.join()
 
-    try:
-        asyncio.run(server_main())
-    except KeyboardInterrupt:
-        pass
+    if not flush_alive_before_shutdown:
+        print("[SERVER] !! Flush thread DIED before shutdown — listener still running, records lost.")
+    else:
+        print("[SERVER] Flush thread was alive until shutdown (good).")
