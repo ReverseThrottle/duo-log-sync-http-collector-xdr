@@ -26,6 +26,16 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------------
+# Logging — UTC timestamps
+# ---------------------------------------------------------------------------
+# Python's logging.basicConfig() uses time.localtime() by default, so the "Z"
+# suffix in the datefmt would be misleading on servers not running UTC.
+# Override the converter so all log timestamps are always true UTC.
+
+class _UTCFormatter(logging.Formatter):
+    converter = time.gmtime
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -256,8 +266,26 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
     conn_sem = threading.Semaphore(max_conn)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            # Windows: SO_EXCLUSIVEADDRUSE prevents any other process from binding
+            # the same port (SO_REUSEADDR does NOT guarantee this on Windows).
+            # SO_EXCLUSIVEADDRUSE also recycles TIME_WAIT sockets on Vista+, so
+            # SO_REUSEADDR is redundant and is omitted to avoid confusion.
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            # POSIX: SO_REUSEADDR recycles TIME_WAIT sockets without allowing
+            # another process to steal the port.
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server.bind((host, port))
+        except OSError as e:
+            logging.critical(
+                "Cannot bind %s:%d — port already in use or permission denied: %s. "
+                "Check that no other instance of duo-xdr-forwarder is running.",
+                host, port, e,
+            )
+            shutdown_event.set()
+            return
         server.listen(16)
         server.settimeout(1.0)
         logging.info("Listening for DLS connections on %s:%d (max %d concurrent)", host, port, max_conn)
@@ -318,6 +346,9 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
         headers["x-xdr-auth-id"] = str(config["api_key_id"])
     # P1: reuse a single TLS connection across all batch POSTs rather than
     # opening and tearing down a new connection on every flush interval.
+    # The session is recreated after a failed batch to ensure a stale keep-alive
+    # connection (common after long idle periods on Windows) does not prevent
+    # the next flush from succeeding.
     session = requests.Session()
     batch = []
     last_flush = time.monotonic()
@@ -352,6 +383,12 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
                     "Batch of %d records failed after all retries — records dropped", len(batch)
                 )
                 batch = []
+                # Recreate the session so a stale keep-alive connection (e.g. after
+                # a long idle period where the XDR server closed the TCP connection)
+                # does not cause the next flush to fail with a ConnectionError.
+                session.close()
+                session = requests.Session()
+                logging.info("HTTP session recreated after send failure")
             last_flush = time.monotonic()
         else:
             last_flush = time.monotonic()
@@ -360,6 +397,7 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     if batch:
         logging.info("Flushing %d remaining records on shutdown", len(batch))
         send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"], session)
+    session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +422,14 @@ def _handle_signal(signum, frame):
 def main():
     config = load_config()
 
+    handler = logging.StreamHandler()
+    handler.setFormatter(_UTCFormatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    ))
     logging.basicConfig(
         level=getattr(logging, config["log_level"], logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
+        handlers=[handler],
     )
 
     signal.signal(signal.SIGTERM, _handle_signal)

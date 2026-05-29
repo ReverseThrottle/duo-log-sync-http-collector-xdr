@@ -211,7 +211,6 @@ if ($svc -and $svc.Status -eq "Running") {
     Write-Host ""
     Write-Host "Service '$ServiceName' is running." -ForegroundColor Green
     Write-Host "Logs: $LogDir"
-    Write-Host "State: $StateDir\state.json"
 } else {
     Write-Host ""
     Write-Host "Service registered but may not have started. Check logs in: $LogDir" -ForegroundColor Yellow
