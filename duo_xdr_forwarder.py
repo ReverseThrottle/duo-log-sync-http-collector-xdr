@@ -76,6 +76,18 @@ def load_config() -> dict:
         print(f"ERROR: LISTEN_PORT must be between 1 and 65535, got: {listen_port}", file=sys.stderr)
         sys.exit(1)
 
+    # Bug 4 fix: reject an empty LISTEN_HOST rather than silently binding to 0.0.0.0.
+    # os.environ.get() returns "" when the variable is set but blank, bypassing the
+    # "127.0.0.1" default — socket.bind(("", port)) on Linux resolves to INADDR_ANY.
+    listen_host = os.environ.get("LISTEN_HOST", "127.0.0.1").strip()
+    if not listen_host:
+        print(
+            "ERROR: LISTEN_HOST is set but empty — refusing to start. "
+            "Set LISTEN_HOST=127.0.0.1 or remove the variable to use the default.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     batch_size = _int("BATCH_SIZE", 100)
     if batch_size < 1:
         print(f"ERROR: BATCH_SIZE must be >= 1, got: {batch_size}", file=sys.stderr)
@@ -97,7 +109,7 @@ def load_config() -> dict:
         "api_key": os.environ["XDR_API_KEY"],
         "api_key_id": os.environ.get("XDR_API_KEY_ID"),  # optional — only needed for some tenants
         "dataset": os.environ.get("XDR_DATASET", "duo_logs"),
-        "listen_host": os.environ.get("LISTEN_HOST", "127.0.0.1"),
+        "listen_host": listen_host,
         "listen_port": listen_port,
         "batch_size": batch_size,
         "max_connections": max_connections,
@@ -159,7 +171,7 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
     while attempt <= max_retries:
         if attempt > 0:
             wait = backoff * (2 ** (attempt - 1))
-            logging.info("Retry %d/%d in %.1fs", attempt, max_retries, wait)
+            logging.info("Retrying (attempt %d of %d total) in %.1fs", attempt + 1, max_retries + 1, wait)
             time.sleep(wait)
         attempt += 1
         try:
@@ -168,9 +180,16 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
                 logging.debug("Batch of %d records accepted (HTTP %d)", len(records), resp.status_code)
                 return True
             elif resp.status_code == 429 or resp.status_code >= 500:
-                logging.warning(
-                    "HTTP %d — will retry (attempt %d/%d)", resp.status_code, attempt, max_retries + 1
-                )
+                # Bug 3 fix: "will retry" is misleading on the last attempt because the
+                # loop exits immediately after — use a different message to make it clear.
+                if attempt <= max_retries:
+                    logging.warning(
+                        "HTTP %d — will retry (attempt %d/%d)", resp.status_code, attempt, max_retries + 1
+                    )
+                else:
+                    logging.warning(
+                        "HTTP %d — final attempt failed (attempt %d/%d)", resp.status_code, attempt, max_retries + 1
+                    )
             else:
                 logging.error(
                     "HTTP %d — no retry (check credentials/config): %s",
@@ -179,9 +198,12 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
                 )
                 return False
         except requests.RequestException as e:
-            logging.warning("Network error — will retry (attempt %d/%d): %s", attempt, max_retries + 1, e)
+            if attempt <= max_retries:
+                logging.warning("Network error — will retry (attempt %d/%d): %s", attempt, max_retries + 1, e)
+            else:
+                logging.warning("Network error on final attempt (%d/%d): %s", attempt, max_retries + 1, e)
 
-    logging.error("All %d retry attempts exhausted for batch of %d records", max_retries, len(records))
+    logging.error("All %d attempts exhausted for batch of %d records", max_retries + 1, len(records))
     return False
 
 
@@ -234,12 +256,23 @@ def handle_connection(conn: socket.socket, addr: tuple, record_queue: queue.Queu
                     continue
                 try:
                     record = json.loads(line)
-                    try:
-                        record_queue.put_nowait(record)
-                    except queue.Full:
-                        logging.warning("Record queue full — dropping record from %s", peer)
                 except json.JSONDecodeError:
                     logging.warning("JSON parse error from %s — skipping %d bytes", peer, len(line))
+                    continue
+                # Bug 1 fix: json.loads() can return any JSON type (null, number, array,
+                # string). enrich_record() calls dict(record) and would raise TypeError or
+                # ValueError on non-dict values, crashing sender_loop. Validate here so
+                # the crash path in main() — which exits 0 — is never reached via this route.
+                if not isinstance(record, dict):
+                    logging.warning(
+                        "Expected JSON object from %s, got %s — skipping",
+                        peer, type(record).__name__,
+                    )
+                    continue
+                try:
+                    record_queue.put_nowait(record)
+                except queue.Full:
+                    logging.warning("Record queue full — dropping record from %s", peer)
     except Exception as e:
         logging.error("Unexpected error on connection %s: %s", peer, e)
     finally:
@@ -328,7 +361,7 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
 # ---------------------------------------------------------------------------
 
 def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threading.Event,
-                listener_thread: threading.Thread = None):
+                listener_thread: threading.Thread = None) -> bool:
     """
     Drain record_queue in batches and POST to Cortex XDR.
 
@@ -337,6 +370,11 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     backoff; records are not dropped unless all retries are exhausted.
 
     Monitors listener_thread health — sets shutdown_event if it dies unexpectedly.
+
+    Returns True for a clean (signal-driven) shutdown, False if the listener crashed.
+    main() uses the return value to decide the exit code; post-hoc is_alive() checks
+    cannot distinguish a clean exit from a crash because the listener always exits
+    before sender_loop finishes draining the queue.
     """
     headers = {
         "Content-Type": "text/plain",
@@ -352,13 +390,22 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     session = requests.Session()
     batch = []
     last_flush = time.monotonic()
+    listener_crashed = False
 
     while not shutdown_event.is_set() or not record_queue.empty():
-        # Check if the listener thread has died unexpectedly
+        # Check if the listener thread has died unexpectedly.
+        # New-bug fix: set listener_crashed BEFORE shutdown_event.set() so main() can
+        # distinguish a listener crash (→ exit 1) from a clean SIGTERM shutdown where
+        # the listener exits normally ~1s after the event is set and is already dead
+        # by the time sender_loop returns. A post-hoc is_alive() check in main() cannot
+        # make this distinction and would false-positive on every clean systemctl stop.
+        # continue instead of break so the outer while re-evaluates its condition and
+        # drains the queue before the final flush (matching the SIGTERM drain guarantee).
         if listener_thread is not None and not listener_thread.is_alive() and not shutdown_event.is_set():
             logging.critical("TCP listener thread died unexpectedly — shutting down")
+            listener_crashed = True
             shutdown_event.set()
-            break
+            continue
 
         # Accumulate records up to batch_size or flush_interval
         flush_deadline = last_flush + config["flush_interval"]
@@ -398,6 +445,7 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
         logging.info("Flushing %d remaining records on shutdown", len(batch))
         send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"], session)
     session.close()
+    return not listener_crashed
 
 
 # ---------------------------------------------------------------------------
@@ -470,13 +518,28 @@ def main():
     )
     listener_thread.start()
 
+    crashed = False
     try:
-        sender_loop(config, record_queue, _shutdown_event, listener_thread)
+        clean = sender_loop(config, record_queue, _shutdown_event, listener_thread)
+        if not clean:
+            # sender_loop returns False when the listener crashed. The loop already drained
+            # the queue and logged CRITICAL before returning, so just mark for exit 1.
+            crashed = True
     except Exception:
+        # Bug 2 fix: an unhandled exception must exit with a nonzero code so that
+        # systemd's Restart=on-failure triggers a restart. Exiting 0 (the previous
+        # behaviour) looks like a clean shutdown and suppresses the restart entirely.
         logging.exception("Unhandled exception in sender loop")
         _shutdown_event.set()
+        crashed = True
 
-    logging.info("Shutdown signal received — shutdown complete")
+    # Bug 5 fix: "Shutdown signal received" was printed even when the exit was caused
+    # by an unhandled exception rather than SIGTERM/SIGINT, misleading log readers.
+    if crashed:
+        logging.critical("Exiting due to unhandled exception")
+        sys.exit(1)
+
+    logging.info("Shutdown complete")
     sys.exit(0)
 
 
