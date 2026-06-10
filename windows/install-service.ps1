@@ -40,8 +40,8 @@ $ErrorActionPreference = "Stop"
 $ServiceName = "DuoXdrForwarder"
 $ServiceDisplay = "Duo Log Sync - Cortex XDR Forwarder"
 $ServiceDesc = "Tails Duo Log Sync output and forwards records to the Cortex XDR HTTP Log Collector."
-$StateDir = "C:\ProgramData\duo-xdr-forwarder"
-$LogDir = "C:\ProgramData\duo-xdr-forwarder\logs"
+$StateDir = "C:\Program Files\duo-xdr-forwarder"
+$LogDir = "C:\Program Files\duo-xdr-forwarder\logs"
 
 # ---------------------------------------------------------------------------
 # Resolve paths

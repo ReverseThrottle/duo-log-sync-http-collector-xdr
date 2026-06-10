@@ -82,7 +82,7 @@ $ForwarderSvcDesc    = "Tails Duo Log Sync output and forwards records to the Co
 $DlsSvcName          = "DuoLogSync"
 $DlsSvcDisplay       = "Duo Log Sync"
 $DlsSvcDesc          = "Polls the Duo Admin API and sends log records to the local XDR forwarder."
-$StateDir            = "C:\ProgramData\duo-xdr-forwarder"
+$StateDir            = "C:\Program Files\duo-xdr-forwarder"
 $LogDir              = "$StateDir\logs"
 $CheckpointDir       = "$StateDir\checkpoints"
 
@@ -280,6 +280,9 @@ $existingEnv = Read-EnvFile $EnvFile
 if (-not $XdrCollectorUrl) { $XdrCollectorUrl = $existingEnv["XDR_COLLECTOR_URL"] }
 if (-not $XdrApiKey)       { $XdrApiKey       = $existingEnv["XDR_API_KEY"] }
 if (-not $XdrApiKeyId)     { $XdrApiKeyId     = $existingEnv["XDR_API_KEY_ID"] }
+if (-not $DuoIkey)         { $DuoIkey         = $existingEnv["DUO_IKEY"] }
+if (-not $DuoSkey)         { $DuoSkey         = $existingEnv["DUO_SKEY"] }
+if (-not $DuoHostname)     { $DuoHostname     = $existingEnv["DUO_HOSTNAME"] }
 
 if (-not $XdrCollectorUrl -or -not $XdrApiKey) {
     Write-Host ""
@@ -301,6 +304,13 @@ $keyIdLine = if ($XdrApiKeyId) { "XDR_API_KEY_ID=$XdrApiKeyId" } else { "# XDR_A
 XDR_COLLECTOR_URL=$XdrCollectorUrl
 XDR_API_KEY=$XdrApiKey
 $keyIdLine
+
+# Duo Log Sync credentials -- used by setup.ps1 to write duo_log_sync\config.yml.
+# Not read at runtime by the forwarder service; safe to leave populated here.
+# Leave blank and pass -SkipDls if DLS is already configured on this host.
+DUO_IKEY=$DuoIkey
+DUO_SKEY=$DuoSkey
+DUO_HOSTNAME=$DuoHostname
 
 # TCP listener -- DLS sends logs here
 LISTEN_HOST=127.0.0.1
@@ -326,7 +336,7 @@ if ($SkipDls) {
 } else {
     Write-Host "[5/7] Configuring duo_log_sync\config.yml..." -ForegroundColor Cyan
 
-    # Resolve Duo credentials: param -> parse existing config.yml -> prompt
+    # Resolve Duo credentials: param -> .env -> existing config.yml -> prompt
     if ((-not $DuoIkey -or -not $DuoSkey -or -not $DuoHostname) -and (Test-Path $DlsConfigFile)) {
         $yaml = Get-Content $DlsConfigFile -Raw
         if (-not $DuoIkey     -and $yaml -match "ikey: '([^']+)'")         { $DuoIkey     = $Matches[1] }
