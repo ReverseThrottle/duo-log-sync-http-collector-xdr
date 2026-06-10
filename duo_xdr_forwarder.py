@@ -171,7 +171,7 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
     while attempt <= max_retries:
         if attempt > 0:
             wait = backoff * (2 ** (attempt - 1))
-            logging.info("Retry %d/%d in %.1fs", attempt, max_retries, wait)
+            logging.info("Retry attempt %d/%d in %.1fs", attempt, max_retries + 1, wait)
             time.sleep(wait)
         attempt += 1
         try:
@@ -387,11 +387,15 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     last_flush = time.monotonic()
 
     while not shutdown_event.is_set() or not record_queue.empty():
-        # Check if the listener thread has died unexpectedly
+        # Check if the listener thread has died unexpectedly.
+        # Finding 1+2 fix: use continue instead of break so the outer while condition
+        # re-evaluates — this drains record_queue before exiting (same guarantee as the
+        # SIGTERM path). A break would skip the drain and silently drop queued records.
+        # The listener crash is reported as a crash (exit 1) by main() below.
         if listener_thread is not None and not listener_thread.is_alive() and not shutdown_event.is_set():
             logging.critical("TCP listener thread died unexpectedly — shutting down")
             shutdown_event.set()
-            break
+            continue
 
         # Accumulate records up to batch_size or flush_interval
         flush_deadline = last_flush + config["flush_interval"]
@@ -512,6 +516,13 @@ def main():
         # behaviour) looks like a clean shutdown and suppresses the restart entirely.
         logging.exception("Unhandled exception in sender loop")
         _shutdown_event.set()
+        crashed = True
+
+    # Finding 1 fix: a listener crash causes sender_loop to return normally (no exception
+    # is raised — it just sets shutdown_event and exits the loop). Detect that case here
+    # so it also exits 1 and triggers Restart=on-failure.
+    if not crashed and not listener_thread.is_alive():
+        logging.critical("TCP listener thread exited abnormally")
         crashed = True
 
     # Bug 5 fix: "Shutdown signal received" was printed even when the exit was caused
