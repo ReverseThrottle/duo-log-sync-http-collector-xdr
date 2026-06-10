@@ -82,7 +82,7 @@ $ForwarderSvcDesc    = "Tails Duo Log Sync output and forwards records to the Co
 $DlsSvcName          = "DuoLogSync"
 $DlsSvcDisplay       = "Duo Log Sync"
 $DlsSvcDesc          = "Polls the Duo Admin API and sends log records to the local XDR forwarder."
-$StateDir            = "C:\Program Files\duo-xdr-forwarder"
+$StateDir            = "C:\ProgramData\duo-xdr-forwarder"
 $LogDir              = "$StateDir\logs"
 $CheckpointDir       = "$StateDir\checkpoints"
 
@@ -166,8 +166,9 @@ function Prompt-Required([string]$Label, [string]$Current, [bool]$Secret = $fals
     while ($true) {
         if ($Secret) {
             $secure = Read-Host "  $Label" -AsSecureString
-            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                          [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+            $bstr   = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            $plain  = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
             if ($plain) { return $plain }
         } else {
             $val = Read-Host "  $Label"
@@ -297,6 +298,21 @@ if (-not $XdrCollectorUrl -or -not $XdrApiKey) {
     Write-Host ""
 }
 
+# Preserve any existing tuning values the user may have customised; fall back to defaults.
+function Use-Existing([string]$Key, [string]$Default) {
+    $v = $existingEnv[$Key]
+    if ($v) { $v } else { $Default }
+}
+$listenHost    = Use-Existing "LISTEN_HOST"           "127.0.0.1"
+$listenPort    = Use-Existing "LISTEN_PORT"           "9999"
+$maxConns      = Use-Existing "MAX_CONNECTIONS"       "10"
+$xdrDataset    = Use-Existing "XDR_DATASET"           "duo_logs"
+$batchSize     = Use-Existing "BATCH_SIZE"            "100"
+$flushInterval = Use-Existing "FLUSH_INTERVAL_SECONDS" "5"
+$logLevel      = Use-Existing "LOG_LEVEL"             "INFO"
+$maxRetries    = Use-Existing "MAX_RETRIES"           "3"
+$retryBackoff  = Use-Existing "RETRY_BACKOFF_SECONDS" "5"
+
 $keyIdLine = if ($XdrApiKeyId) { "XDR_API_KEY_ID=$XdrApiKeyId" } else { "# XDR_API_KEY_ID=" }
 
 @"
@@ -313,17 +329,17 @@ DUO_SKEY=$DuoSkey
 DUO_HOSTNAME=$DuoHostname
 
 # TCP listener -- DLS sends logs here
-LISTEN_HOST=127.0.0.1
-LISTEN_PORT=9999
-MAX_CONNECTIONS=10
+LISTEN_HOST=$listenHost
+LISTEN_PORT=$listenPort
+MAX_CONNECTIONS=$maxConns
 
 # Optional tuning
-XDR_DATASET=duo_logs
-BATCH_SIZE=100
-FLUSH_INTERVAL_SECONDS=5
-LOG_LEVEL=INFO
-MAX_RETRIES=3
-RETRY_BACKOFF_SECONDS=5
+XDR_DATASET=$xdrDataset
+BATCH_SIZE=$batchSize
+FLUSH_INTERVAL_SECONDS=$flushInterval
+LOG_LEVEL=$logLevel
+MAX_RETRIES=$maxRetries
+RETRY_BACKOFF_SECONDS=$retryBackoff
 "@ | Set-Content -Path $EnvFile -Encoding UTF8
 
 Write-Host "  Written: $EnvFile"

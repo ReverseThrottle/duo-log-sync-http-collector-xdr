@@ -297,7 +297,7 @@ The script will:
 2. Install Duo Log Sync into the venv
 3. Install NSSM via `winget` if not already present
 4. Prompt for your Cortex XDR and Duo Admin API credentials, then write `.env` and `duo_log_sync\config.yml`
-5. Create `C:\Program Files\duo-xdr-forwarder\` for logs and checkpoints
+5. Create `C:\ProgramData\duo-xdr-forwarder\` for logs and checkpoints
 6. Register and start **both** services (`DuoXdrForwarder` and `DuoLogSync`) as auto-start Windows services
 
 To skip prompts, pass credentials directly:
@@ -321,7 +321,7 @@ To uninstall both services:
 
 If DLS is already installed and managed externally, pass `-SkipDls` to register only the forwarder service.
 
-Service logs are written to `C:\Program Files\duo-xdr-forwarder\logs\`.
+Service logs are written to `C:\ProgramData\duo-xdr-forwarder\logs\`.
 
 ---
 
@@ -494,7 +494,7 @@ LOG_LEVEL=DEBUG .venv/bin/python3 duo_xdr_forwarder.py   # Verbose forwarder out
 
 **Windows:**
 ```
-C:\Program Files\duo-xdr-forwarder\logs\stdout.log
-C:\Program Files\duo-xdr-forwarder\logs\stderr.log
+C:\ProgramData\duo-xdr-forwarder\logs\stdout.log
+C:\ProgramData\duo-xdr-forwarder\logs\stderr.log
 ```
 
