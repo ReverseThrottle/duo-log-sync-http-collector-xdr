@@ -171,7 +171,7 @@ def send_batch(records: list, url: str, headers: dict, max_retries: int, backoff
     while attempt <= max_retries:
         if attempt > 0:
             wait = backoff * (2 ** (attempt - 1))
-            logging.info("Retry attempt %d/%d in %.1fs", attempt, max_retries + 1, wait)
+            logging.info("Retrying (attempt %d of %d total) in %.1fs", attempt + 1, max_retries + 1, wait)
             time.sleep(wait)
         attempt += 1
         try:
@@ -361,7 +361,7 @@ def tcp_listener(config: dict, record_queue: queue.Queue, shutdown_event: thread
 # ---------------------------------------------------------------------------
 
 def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threading.Event,
-                listener_thread: threading.Thread = None):
+                listener_thread: threading.Thread = None) -> bool:
     """
     Drain record_queue in batches and POST to Cortex XDR.
 
@@ -370,6 +370,11 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     backoff; records are not dropped unless all retries are exhausted.
 
     Monitors listener_thread health — sets shutdown_event if it dies unexpectedly.
+
+    Returns True for a clean (signal-driven) shutdown, False if the listener crashed.
+    main() uses the return value to decide the exit code; post-hoc is_alive() checks
+    cannot distinguish a clean exit from a crash because the listener always exits
+    before sender_loop finishes draining the queue.
     """
     headers = {
         "Content-Type": "text/plain",
@@ -385,15 +390,20 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
     session = requests.Session()
     batch = []
     last_flush = time.monotonic()
+    listener_crashed = False
 
     while not shutdown_event.is_set() or not record_queue.empty():
         # Check if the listener thread has died unexpectedly.
-        # Finding 1+2 fix: use continue instead of break so the outer while condition
-        # re-evaluates — this drains record_queue before exiting (same guarantee as the
-        # SIGTERM path). A break would skip the drain and silently drop queued records.
-        # The listener crash is reported as a crash (exit 1) by main() below.
+        # New-bug fix: set listener_crashed BEFORE shutdown_event.set() so main() can
+        # distinguish a listener crash (→ exit 1) from a clean SIGTERM shutdown where
+        # the listener exits normally ~1s after the event is set and is already dead
+        # by the time sender_loop returns. A post-hoc is_alive() check in main() cannot
+        # make this distinction and would false-positive on every clean systemctl stop.
+        # continue instead of break so the outer while re-evaluates its condition and
+        # drains the queue before the final flush (matching the SIGTERM drain guarantee).
         if listener_thread is not None and not listener_thread.is_alive() and not shutdown_event.is_set():
             logging.critical("TCP listener thread died unexpectedly — shutting down")
+            listener_crashed = True
             shutdown_event.set()
             continue
 
@@ -435,6 +445,7 @@ def sender_loop(config: dict, record_queue: queue.Queue, shutdown_event: threadi
         logging.info("Flushing %d remaining records on shutdown", len(batch))
         send_batch(batch, config["url"], headers, config["max_retries"], config["backoff"], session)
     session.close()
+    return not listener_crashed
 
 
 # ---------------------------------------------------------------------------
@@ -509,20 +520,17 @@ def main():
 
     crashed = False
     try:
-        sender_loop(config, record_queue, _shutdown_event, listener_thread)
+        clean = sender_loop(config, record_queue, _shutdown_event, listener_thread)
+        if not clean:
+            # sender_loop returns False when the listener crashed. The loop already drained
+            # the queue and logged CRITICAL before returning, so just mark for exit 1.
+            crashed = True
     except Exception:
         # Bug 2 fix: an unhandled exception must exit with a nonzero code so that
         # systemd's Restart=on-failure triggers a restart. Exiting 0 (the previous
         # behaviour) looks like a clean shutdown and suppresses the restart entirely.
         logging.exception("Unhandled exception in sender loop")
         _shutdown_event.set()
-        crashed = True
-
-    # Finding 1 fix: a listener crash causes sender_loop to return normally (no exception
-    # is raised — it just sets shutdown_event and exits the loop). Detect that case here
-    # so it also exits 1 and triggers Restart=on-failure.
-    if not crashed and not listener_thread.is_alive():
-        logging.critical("TCP listener thread exited abnormally")
         crashed = True
 
     # Bug 5 fix: "Shutdown signal received" was printed even when the exit was caused
