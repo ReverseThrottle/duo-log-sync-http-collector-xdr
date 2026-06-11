@@ -501,11 +501,11 @@ Write-Host "=== Setup Complete ===" -ForegroundColor Green
 Write-Host ""
 
 $fwdColor = if ($fwdSvc -and $fwdSvc.Status -eq "Running") { "Green" } else { "Yellow" }
-Write-Host "  $ForwarderSvcName : $($fwdSvc?.Status ?? 'unknown')" -ForegroundColor $fwdColor
+Write-Host "  $ForwarderSvcName : $(if ($fwdSvc) { $fwdSvc.Status } else { 'unknown' })" -ForegroundColor $fwdColor
 
 if ($dlsRegistered) {
     $dlsColor = if ($dlsSvc -and $dlsSvc.Status -eq "Running") { "Green" } else { "Yellow" }
-    Write-Host "  $DlsSvcName       : $($dlsSvc?.Status ?? 'unknown')" -ForegroundColor $dlsColor
+    Write-Host "  $DlsSvcName       : $(if ($dlsSvc) { $dlsSvc.Status } else { 'unknown' })" -ForegroundColor $dlsColor
 } elseif ($SkipDls) {
     Write-Host "  $DlsSvcName       : skipped (-SkipDls)" -ForegroundColor Gray
 }
