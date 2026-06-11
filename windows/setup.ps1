@@ -8,7 +8,7 @@
     Duo Log Sync), installs NSSM via winget if needed, writes configuration files,
     and registers both the XDR forwarder and DLS as auto-start Windows services.
 
-    Re-running this script is idempotent — existing services are replaced in-place
+    Re-running this script is idempotent - existing services are replaced in-place
     and existing configuration values are preserved as defaults.
 
 .PARAMETER Action
@@ -38,11 +38,11 @@
     is already installed and managed externally on this host.
 
 .EXAMPLE
-    # Interactive install — prompts for credentials
+    # Interactive install - prompts for credentials
     .\windows\setup.ps1
 
 .EXAMPLE
-    # Fully automated install — no prompts
+    # Fully automated install - no prompts
     .\windows\setup.ps1 `
         -XdrCollectorUrl "https://api-tenant.xdr.us.paloaltonetworks.com/logs/v1/event" `
         -XdrApiKey "your-xdr-api-key" `
@@ -117,7 +117,7 @@ function Find-NSSM {
 }
 
 function Install-NSSM {
-    Write-Host "  NSSM not found — attempting install via winget..." -ForegroundColor Cyan
+    Write-Host "  NSSM not found - attempting install via winget..." -ForegroundColor Cyan
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         Write-Host ""
         Write-Host "  winget is not available on this system." -ForegroundColor Yellow
@@ -159,7 +159,7 @@ function Read-EnvFile([string]$Path) {
 # so the user can press Enter to keep it. Loops until a non-empty value is provided.
 function Prompt-Required([string]$Label, [string]$Current, [bool]$Secret = $false) {
     if ($Current) {
-        $hint     = if ($Secret) { "[already set — press Enter to keep]" } else { "[$Current]" }
+        $hint     = if ($Secret) { "[already set - press Enter to keep]" } else { "[$Current]" }
         $response = Read-Host "  $Label $hint"
         return if ($response) { $response } else { $Current }
     }
@@ -197,7 +197,7 @@ function Remove-ServiceIfExists([string]$NssmPath, [string]$Name) {
 # ---------------------------------------------------------------------------
 if ($Action -eq "uninstall") {
     $nssm = Find-NSSM
-    if (-not $nssm) { Write-Error "NSSM not found — cannot uninstall services." }
+    if (-not $nssm) { Write-Error "NSSM not found - cannot uninstall services." }
 
     # Stop DLS first so it can't reconnect while the forwarder is being removed
     foreach ($svc in @($DlsSvcName, $ForwarderSvcName)) {
@@ -214,7 +214,7 @@ if ($Action -eq "uninstall") {
             & $nssm remove $svc confirm
             Write-Host "  Removed '$svc'." -ForegroundColor Green
         } else {
-            Write-Host "Service '$svc' not found — skipping."
+            Write-Host "Service '$svc' not found - skipping."
         }
     }
     Write-Host ""
@@ -226,7 +226,7 @@ if ($Action -eq "uninstall") {
 # Install
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Host "=== Duo XDR Forwarder — Windows Setup ===" -ForegroundColor Cyan
+Write-Host "=== Duo XDR Forwarder - Windows Setup ===" -ForegroundColor Cyan
 Write-Host "Project: $ProjectDir"
 Write-Host ""
 
@@ -477,7 +477,7 @@ if (-not $SkipDls) {
 }
 
 # ---------------------------------------------------------------------------
-# Start services — forwarder first so the TCP port is bound before DLS connects
+# Start services - forwarder first so the TCP port is bound before DLS connects
 # ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host "Starting services..." -ForegroundColor Cyan
