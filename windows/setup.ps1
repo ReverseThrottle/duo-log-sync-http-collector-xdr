@@ -161,7 +161,7 @@ function Prompt-Required([string]$Label, [string]$Current, [bool]$Secret = $fals
     if ($Current) {
         $hint     = if ($Secret) { "[already set - press Enter to keep]" } else { "[$Current]" }
         $response = Read-Host "  $Label $hint"
-        return if ($response) { $response } else { $Current }
+        if ($response) { return $response } else { return $Current }
     }
     while ($true) {
         if ($Secret) {
@@ -448,6 +448,9 @@ foreach ($dir in @($StateDir, $LogDir, $CheckpointDir)) {
 Write-Host "[7/7] Registering Windows services..." -ForegroundColor Cyan
 
 # --- Forwarder ---
+if (-not (Test-Path $ForwarderScript)) {
+    Write-Error "Forwarder script not found at '$ForwarderScript'. Verify the project directory is complete and re-run."
+}
 Write-Host "  Registering '$ForwarderSvcName'..."
 Remove-ServiceIfExists $nssm $ForwarderSvcName
 & $nssm install $ForwarderSvcName $PythonExe $ForwarderScript
