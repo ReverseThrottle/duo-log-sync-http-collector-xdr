@@ -161,7 +161,7 @@ function Prompt-Required([string]$Label, [string]$Current, [bool]$Secret = $fals
     if ($Current) {
         $hint     = if ($Secret) { "[already set - press Enter to keep]" } else { "[$Current]" }
         $response = Read-Host "  $Label $hint"
-        return if ($response) { $response } else { $Current }
+        if ($response) { return $response } else { return $Current }
     }
     while ($true) {
         if ($Secret) {
@@ -239,6 +239,17 @@ $systemPython = try { (Get-Command python -ErrorAction Stop).Source } catch { $n
 if (-not $systemPython) {
     Write-Error "python.exe not found in PATH. Install Python 3.8+ from https://www.python.org/downloads/ (check 'Add to PATH') and re-run."
 }
+if ($systemPython -like "*\WindowsApps\*") {
+    Write-Host ""
+    Write-Host "  ERROR: '$systemPython' is the Windows Store Python stub, not a real Python install." -ForegroundColor Red
+    Write-Host "  Fix one of two ways:" -ForegroundColor Yellow
+    Write-Host "    1. Disable the stub: Settings > Apps > Advanced app settings > App execution aliases" -ForegroundColor Yellow
+    Write-Host "       -> turn off 'python.exe' and 'python3.exe', then re-run this script." -ForegroundColor Yellow
+    Write-Host "    2. Install Python 3.8+ from https://www.python.org/downloads/ (check 'Add to PATH')," -ForegroundColor Yellow
+    Write-Host "       then re-run this script." -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
 Write-Host "  Python: $systemPython"
 
 if (-not (Test-Path $VenvDir)) {
@@ -246,6 +257,9 @@ if (-not (Test-Path $VenvDir)) {
     & $systemPython -m venv $VenvDir
 } else {
     Write-Host "  .venv already exists."
+}
+if (-not (Test-Path $PipExe)) {
+    Write-Error "Venv creation failed - pip.exe not found at '$PipExe'. Verify your Python install is not corrupted and re-run."
 }
 
 Write-Host "  Installing forwarder dependencies..."
@@ -434,6 +448,9 @@ foreach ($dir in @($StateDir, $LogDir, $CheckpointDir)) {
 Write-Host "[7/7] Registering Windows services..." -ForegroundColor Cyan
 
 # --- Forwarder ---
+if (-not (Test-Path $ForwarderScript)) {
+    Write-Error "Forwarder script not found at '$ForwarderScript'. Verify the project directory is complete and re-run."
+}
 Write-Host "  Registering '$ForwarderSvcName'..."
 Remove-ServiceIfExists $nssm $ForwarderSvcName
 & $nssm install $ForwarderSvcName $PythonExe $ForwarderScript
