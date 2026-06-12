@@ -4,6 +4,9 @@
     One-shot Windows installer for duo-log-sync-http-collector-xdr.
 
 .DESCRIPTION
+    NOTE: This script is a work in progress. For production deployments, follow
+    the manual setup steps in README.md instead.
+
     Creates the Python virtual environment, installs all dependencies (including
     Duo Log Sync), installs NSSM via winget if needed, writes configuration files,
     and registers both the XDR forwarder and DLS as auto-start Windows services.
