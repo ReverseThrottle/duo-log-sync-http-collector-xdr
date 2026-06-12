@@ -269,14 +269,38 @@ Write-Host "  Done."
 # ---------------------------------------------------------------------------
 # [2/7] Duo Log Sync
 # ---------------------------------------------------------------------------
-Write-Host "[2/7] Installing Duo Log Sync..." -ForegroundColor Cyan
+if ($SkipDls) {
+    Write-Host "[2/7] Skipping Duo Log Sync install (-SkipDls)." -ForegroundColor Gray
+} else {
+    Write-Host "[2/7] Installing Duo Log Sync..." -ForegroundColor Cyan
 
-if (-not (Test-Path $DlsSrcDir)) {
-    Write-Error "duo_log_sync directory not found at: $DlsSrcDir"
+    if (-not (Test-Path $DlsSrcDir)) {
+        Write-Host "  duo_log_sync not found - cloning from GitHub..." -ForegroundColor Cyan
+        $git = try { (Get-Command git -ErrorAction Stop).Source } catch { $null }
+        if (-not $git) {
+            Write-Host ""
+            Write-Host "  ERROR: git is not in PATH and duo_log_sync is not present." -ForegroundColor Red
+            Write-Host "  Fix one of two ways:" -ForegroundColor Yellow
+            Write-Host "    1. Install Git from https://git-scm.com/download/win, then re-run." -ForegroundColor Yellow
+            Write-Host "    2. Manually clone into the project directory:" -ForegroundColor Yellow
+            Write-Host "         git clone https://github.com/duosecurity/duo_log_sync.git" -ForegroundColor Yellow
+            Write-Host "       then re-run this script." -ForegroundColor Yellow
+            Write-Host ""
+            exit 1
+        }
+        & $git clone --quiet https://github.com/duosecurity/duo_log_sync.git $DlsSrcDir
+        if (-not (Test-Path $DlsSrcDir)) {
+            Write-Error "git clone of duo_log_sync failed. Check your internet connection and re-run."
+        }
+        Write-Host "  Cloned duo_log_sync."
+    } else {
+        Write-Host "  duo_log_sync already present."
+    }
+
+    & $PipExe install --quiet setuptools
+    & $PipExe install --quiet -e $DlsSrcDir
+    Write-Host "  Installed DLS from: $DlsSrcDir"
 }
-& $PipExe install --quiet setuptools
-& $PipExe install --quiet -e $DlsSrcDir
-Write-Host "  Installed DLS from: $DlsSrcDir"
 
 # ---------------------------------------------------------------------------
 # [3/7] NSSM
