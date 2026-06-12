@@ -271,11 +271,14 @@ DLS should be deployed and managed separately (also as a systemd service or alon
 
 ## Installation — Windows
 
+> **Note:** Install and configure [Duo Log Sync](https://github.com/duosecurity/duo_log_sync) first, following [Duo's official documentation](https://duo.com/docs/duo-log-sync). When configuring the DLS server target, point it at `127.0.0.1:9999` (TCP) — that is the address this forwarder listens on.
+
 ### Prerequisites
 
-- [Python 3.8+](https://www.python.org/downloads/) installed and on `PATH` (check "Add Python to PATH" during install)
-- PowerShell 5.1+ (run as Administrator)
-- NSSM is installed automatically by `setup.ps1` via `winget` if not already present
+- [Python 3.8+](https://www.python.org/downloads/) — check **"Add Python to PATH"** during install; do **not** use the Microsoft Store version
+- [Git for Windows](https://git-scm.com/download/win)
+- [NSSM](https://nssm.cc/download) (Non-Sucking Service Manager) — place `nssm.exe` in `C:\nssm\` or add it to `PATH`
+- PowerShell 5.1+ (run **as Administrator**)
 
 ### 1. Clone the repository
 
@@ -284,44 +287,100 @@ git clone https://github.com/ReverseThrottle/duo-log-sync-http-collector-xdr.git
 cd duo-log-sync-http-collector-xdr
 ```
 
-### 2. Run the setup script
-
-Open PowerShell **as Administrator** and run:
+### 2. Set up the Python environment
 
 ```powershell
-.\windows\setup.ps1
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
 
-The script will:
-1. Create the Python virtual environment and install all dependencies
-2. Install Duo Log Sync into the venv
-3. Install NSSM via `winget` if not already present
-4. Prompt for your Cortex XDR and Duo Admin API credentials, then write `.env` and `duo_log_sync\config.yml`
-5. Create `C:\ProgramData\duo-xdr-forwarder\` for logs and checkpoints
-6. Register and start **both** services (`DuoXdrForwarder` and `DuoLogSync`) as auto-start Windows services
-
-To skip prompts, pass credentials directly:
+### 3. Configure the forwarder
 
 ```powershell
-.\windows\setup.ps1 `
-    -XdrCollectorUrl "https://api-<tenant>.xdr.us.paloaltonetworks.com/logs/v1/event" `
-    -XdrApiKey "your-xdr-api-key" `
-    -DuoIkey "DIXXXXXXXXXXXXXXXXXX" `
-    -DuoSkey "your-duo-secret-key" `
-    -DuoHostname "api-XXXXXXXX.duosecurity.com"
+Copy-Item .env.example .env
+notepad .env
 ```
 
-Re-running `setup.ps1` is safe — existing services are replaced in-place and previously entered values are shown as defaults.
+Fill in your Cortex XDR credentials (see [Configuration Reference](#configuration-reference) for all options):
 
-To uninstall both services:
+```ini
+XDR_COLLECTOR_URL=https://api-<tenant>.xdr.us.paloaltonetworks.com/logs/v1/event
+XDR_API_KEY=<your-xdr-api-key>
+LISTEN_HOST=127.0.0.1
+LISTEN_PORT=9999
+```
+
+### 4. Test manually before deploying as a service
+
+Open two Administrator PowerShell windows:
+
+**Window 1 — start the forwarder:**
+```powershell
+cd duo-log-sync-http-collector-xdr
+.venv\Scripts\python duo_xdr_forwarder.py
+```
+Expected output:
+```
+2026-01-01T00:00:00Z INFO Starting duo-xdr-forwarder: listen=127.0.0.1:9999 ...
+2026-01-01T00:00:00Z INFO Record queue max size: 20000 records
+2026-01-01T00:00:00Z INFO Listening for DLS connections on 127.0.0.1:9999
+```
+
+**Window 2 — start DLS** (if not already running as a service):
+```powershell
+<path-to-dls>\duologsync <path-to-config.yml>
+```
+
+After ~2 minutes (DLS's first API poll), the forwarder should log:
+```
+2026-01-01T00:02:00Z INFO DLS connected: 127.0.0.1:XXXXX
+2026-01-01T00:02:05Z INFO Sent 42 records to XDR
+```
+
+Verify records in Cortex XDR via XQL:
+```
+dataset = duo_logs | limit 10
+```
+
+### 5. Register as a Windows service
+
+Run the following from an **Administrator** PowerShell prompt in the project directory:
 
 ```powershell
-.\windows\setup.ps1 -Action uninstall
+New-Item -ItemType Directory -Force "C:\ProgramData\duo-xdr-forwarder\logs"
+
+$ProjectDir = (Get-Location).Path
+$PythonExe  = "$ProjectDir\.venv\Scripts\python.exe"
+$Script     = "$ProjectDir\duo_xdr_forwarder.py"
+$LogDir     = "C:\ProgramData\duo-xdr-forwarder\logs"
+
+nssm install DuoXdrForwarder $PythonExe $Script
+nssm set DuoXdrForwarder DisplayName    "Duo XDR Forwarder"
+nssm set DuoXdrForwarder Description    "Forwards Duo log records to Cortex XDR."
+nssm set DuoXdrForwarder Start          SERVICE_AUTO_START
+nssm set DuoXdrForwarder AppDirectory   $ProjectDir
+nssm set DuoXdrForwarder AppStdout      "$LogDir\forwarder-stdout.log"
+nssm set DuoXdrForwarder AppStderr      "$LogDir\forwarder-stderr.log"
+nssm set DuoXdrForwarder AppRotateFiles 1
+nssm set DuoXdrForwarder AppRotateBytes 10485760
+
+nssm start DuoXdrForwarder
+Get-Service DuoXdrForwarder
 ```
 
-If DLS is already installed and managed externally, pass `-SkipDls` to register only the forwarder service.
+The service reads credentials from `.env` automatically on startup. Service logs are written to `C:\ProgramData\duo-xdr-forwarder\logs\`.
 
-Service logs are written to `C:\ProgramData\duo-xdr-forwarder\logs\`.
+To uninstall:
+```powershell
+nssm stop DuoXdrForwarder
+nssm remove DuoXdrForwarder confirm
+```
+
+---
+
+### Automated installer (work in progress)
+
+`windows\setup.ps1` is an all-in-one script that automates the steps above, including fetching and configuring DLS. It is functional but still being refined — for production deployments the manual steps above are recommended.
 
 ---
 
