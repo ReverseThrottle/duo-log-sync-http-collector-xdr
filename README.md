@@ -314,48 +314,7 @@ XDR_API_KEY=<your-xdr-api-key>
 
 The `DUO_IKEY`, `DUO_SKEY`, and `DUO_HOSTNAME` fields in `.env.example` are only used by `windows\setup.ps1` to generate DLS's `config.yml`. The forwarder itself never reads them — leave them blank or remove them.
 
-### 4. Configure Duo Log Sync
-
-Create `duo_log_sync\config.yml` in the project directory. Fill in your Duo Admin API credentials:
-
-```yaml
-version: '1.0.0'
-
-dls_settings:
-  log_filepath: 'C:\ProgramData\duologsync\duologsync.log'
-  log_format: 'JSON'
-  api:
-    offset: 180       # Days of history to fetch on first run
-    timeout: 120      # Seconds between API polls (minimum enforced by DLS)
-  checkpointing:
-    enabled: True
-    directory: 'C:\ProgramData\duologsync\checkpoints'
-
-servers:
-  - id: 'xdr-forwarder'
-    hostname: '127.0.0.1'
-    port: 9999
-    protocol: 'TCP'
-
-account:
-  ikey: '<your-duo-integration-key>'
-  skey: '<your-duo-secret-key>'
-  hostname: '<your-duo-api-hostname>'   # e.g. api-XXXXXXXX.duosecurity.com
-
-  endpoint_server_mappings:
-    - endpoints: ['auth', 'activity']
-      server: 'xdr-forwarder'
-
-  is_msp: False
-```
-
-Create the DLS log directories:
-
-```powershell
-New-Item -ItemType Directory -Force "C:\ProgramData\duologsync\checkpoints"
-```
-
-### 5. Test manually before deploying as a service
+### 4. Test manually before deploying as a service
 
 Open two Administrator PowerShell windows:
 
@@ -387,7 +346,7 @@ Verify records in Cortex XDR via XQL:
 dataset = duo_logs | limit 10
 ```
 
-### 6. Register as a Windows service
+### 5. Register as a Windows service
 
 Run the following from an **Administrator** PowerShell prompt:
 
