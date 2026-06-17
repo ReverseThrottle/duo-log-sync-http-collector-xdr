@@ -302,6 +302,11 @@ if ($SkipDls) {
 
     & $PipExe install --quiet setuptools
     & $PipExe install --quiet -e $DlsSrcDir
+    # DLS pins Cerberus==1.3.2, which imports pkg_resources — removed in setuptools 81+.
+    # Cerberus 1.3.5+ replaces it with importlib.metadata and is a drop-in replacement.
+    # pip will warn about the version conflict with DLS's pin; the warning is harmless.
+    Write-Host "  Applying cerberus compatibility fix (setuptools 81+ / pkg_resources)..."
+    & $PipExe install --quiet "cerberus>=1.3.5"
     Write-Host "  Installed DLS from: $DlsSrcDir"
 }
 
