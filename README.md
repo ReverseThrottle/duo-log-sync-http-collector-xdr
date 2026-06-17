@@ -280,11 +280,15 @@ DLS should be deployed and managed separately (also as a systemd service or alon
 - [NSSM](https://nssm.cc/download) (Non-Sucking Service Manager) — place `nssm.exe` in `C:\nssm\` or add it to `PATH`
 - PowerShell 5.1+ (run **as Administrator**)
 
+> **Important — install location:** Do not install under `C:\Program Files\` or any path containing spaces. NSSM does not reliably quote space-containing script paths when registering a service, causing Python to receive a truncated argument and exit immediately with `can't open file 'C:\\Program'`. Use `C:\ProgramData\` — it has no spaces and is writable without elevation.
+
 ### 1. Clone the repository
 
+Clone directly into `C:\ProgramData\` to avoid path-quoting issues with NSSM:
+
 ```powershell
-git clone https://github.com/ReverseThrottle/duo-log-sync-http-collector-xdr.git
-cd duo-log-sync-http-collector-xdr
+git clone https://github.com/ReverseThrottle/duo-log-sync-http-collector-xdr.git C:\ProgramData\dls-http-collector-xdr-main
+cd C:\ProgramData\dls-http-collector-xdr-main
 ```
 
 ### 2. Set up the Python environment
@@ -301,22 +305,63 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Fill in your Cortex XDR credentials (see [Configuration Reference](#configuration-reference) for all options):
+Only `XDR_COLLECTOR_URL` and `XDR_API_KEY` are required — everything else has sensible defaults (see [Configuration Reference](#configuration-reference)):
 
 ```ini
 XDR_COLLECTOR_URL=https://api-<tenant>.xdr.us.paloaltonetworks.com/logs/v1/event
 XDR_API_KEY=<your-xdr-api-key>
-LISTEN_HOST=127.0.0.1
-LISTEN_PORT=9999
 ```
 
-### 4. Test manually before deploying as a service
+The `DUO_IKEY`, `DUO_SKEY`, and `DUO_HOSTNAME` fields in `.env.example` are only used by `windows\setup.ps1` to generate DLS's `config.yml`. The forwarder itself never reads them — leave them blank or remove them.
+
+### 4. Configure Duo Log Sync
+
+Create `duo_log_sync\config.yml` in the project directory. Fill in your Duo Admin API credentials:
+
+```yaml
+version: '1.0.0'
+
+dls_settings:
+  log_filepath: 'C:\ProgramData\duologsync\duologsync.log'
+  log_format: 'JSON'
+  api:
+    offset: 180       # Days of history to fetch on first run
+    timeout: 120      # Seconds between API polls (minimum enforced by DLS)
+  checkpointing:
+    enabled: True
+    directory: 'C:\ProgramData\duologsync\checkpoints'
+
+servers:
+  - id: 'xdr-forwarder'
+    hostname: '127.0.0.1'
+    port: 9999
+    protocol: 'TCP'
+
+account:
+  ikey: '<your-duo-integration-key>'
+  skey: '<your-duo-secret-key>'
+  hostname: '<your-duo-api-hostname>'   # e.g. api-XXXXXXXX.duosecurity.com
+
+  endpoint_server_mappings:
+    - endpoints: ['auth', 'activity']
+      server: 'xdr-forwarder'
+
+  is_msp: False
+```
+
+Create the DLS log directories:
+
+```powershell
+New-Item -ItemType Directory -Force "C:\ProgramData\duologsync\checkpoints"
+```
+
+### 5. Test manually before deploying as a service
 
 Open two Administrator PowerShell windows:
 
 **Window 1 — start the forwarder:**
 ```powershell
-cd duo-log-sync-http-collector-xdr
+cd C:\ProgramData\dls-http-collector-xdr-main
 .venv\Scripts\python duo_xdr_forwarder.py
 ```
 Expected output:
@@ -328,7 +373,7 @@ Expected output:
 
 **Window 2 — start DLS** (if not already running as a service):
 ```powershell
-<path-to-dls>\duologsync <path-to-config.yml>
+<path-to-dls-venv>\Scripts\duologsync <path-to-config.yml>
 ```
 
 After ~2 minutes (DLS's first API poll), the forwarder should log:
@@ -342,17 +387,17 @@ Verify records in Cortex XDR via XQL:
 dataset = duo_logs | limit 10
 ```
 
-### 5. Register as a Windows service
+### 6. Register as a Windows service
 
-Run the following from an **Administrator** PowerShell prompt in the project directory:
+Run the following from an **Administrator** PowerShell prompt:
 
 ```powershell
-New-Item -ItemType Directory -Force "C:\ProgramData\duo-xdr-forwarder\logs"
-
-$ProjectDir = (Get-Location).Path
+$ProjectDir = "C:\ProgramData\dls-http-collector-xdr-main"
 $PythonExe  = "$ProjectDir\.venv\Scripts\python.exe"
 $Script     = "$ProjectDir\duo_xdr_forwarder.py"
 $LogDir     = "C:\ProgramData\duo-xdr-forwarder\logs"
+
+New-Item -ItemType Directory -Force $LogDir
 
 nssm install DuoXdrForwarder $PythonExe $Script
 nssm set DuoXdrForwarder DisplayName    "Duo XDR Forwarder"
@@ -368,7 +413,15 @@ nssm start DuoXdrForwarder
 Get-Service DuoXdrForwarder
 ```
 
-The service reads credentials from `.env` automatically on startup. Service logs are written to `C:\ProgramData\duo-xdr-forwarder\logs\`.
+`AppDirectory` is required — it sets the working directory so that `python-dotenv` can locate the `.env` file at startup. Without it the service exits immediately with a missing credentials error.
+
+Verify the service started correctly:
+
+```powershell
+Get-Content "$LogDir\forwarder-stderr.log" -Tail 20
+```
+
+> **Note on log files:** All forwarder output — info, warnings, and errors alike — goes to `forwarder-stderr.log`. This is expected: Python's `logging` module writes to `sys.stderr` by default, and NSSM captures stderr separately from stdout. `forwarder-stdout.log` will be empty under normal operation.
 
 To uninstall:
 ```powershell
@@ -380,7 +433,7 @@ nssm remove DuoXdrForwarder confirm
 
 ### Automated installer (work in progress)
 
-`windows\setup.ps1` is an all-in-one script that automates the steps above, including fetching and configuring DLS. It is functional but still being refined — for production deployments the manual steps above are recommended.
+`windows\setup.ps1` is an all-in-one script that automates the steps above, including fetching and configuring DLS. It is still being refined — the manual steps above are recommended for production deployments.
 
 ---
 
@@ -427,7 +480,7 @@ All configuration is via environment variables, loaded from a `.env` file in the
 |---|---|---|
 | Duo `skey` | `duo_log_sync/config.yml` | Restrict file permissions: `chmod 600 config.yml`. This file must **never** be committed to git (it is gitignored by this repo). |
 | `XDR_API_KEY` | `.env` file | Restrict file permissions: `chmod 600 .env`. This file is gitignored. |
-| `XDR_API_KEY` (Windows) | Windows Registry (via NSSM) | Restrict registry key ACL to `SYSTEM` and `Administrators` only after service installation. The installer script prints a reminder. |
+| `XDR_API_KEY` (Windows) | `.env` file in the project directory (read at service startup via `AppDirectory`) | Restrict file ACL to `SYSTEM` and `Administrators`: right-click → Properties → Security. The file is gitignored. |
 
 ### Network security
 
@@ -546,14 +599,22 @@ journalctl -u duo-xdr-forwarder -f          # Forwarder logs (live)
 tail -f /var/log/duologsync/duologsync.log   # DLS application logs
 ```
 
-**Running manually:**
+**Running manually (Linux):**
 ```bash
-LOG_LEVEL=DEBUG .venv/bin/python3 duo_xdr_forwarder.py   # Verbose forwarder output
+LOG_LEVEL=DEBUG .venv/bin/python3 duo_xdr_forwarder.py
 ```
 
-**Windows:**
+**Windows (service logs):**
+```powershell
+# All forwarder output goes to stderr.log — stdout.log will be empty
+Get-Content "C:\ProgramData\duo-xdr-forwarder\logs\forwarder-stderr.log" -Tail 50 -Wait
 ```
-C:\ProgramData\duo-xdr-forwarder\logs\stdout.log
-C:\ProgramData\duo-xdr-forwarder\logs\stderr.log
+
+**Windows (running manually with verbose output):**
+```powershell
+cd C:\ProgramData\dls-http-collector-xdr-main
+$env:LOG_LEVEL = "DEBUG"
+.venv\Scripts\python duo_xdr_forwarder.py
 ```
+
 
