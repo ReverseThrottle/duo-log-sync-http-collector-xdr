@@ -271,8 +271,6 @@ DLS should be deployed and managed separately (also as a systemd service or alon
 
 ## Installation — Windows
 
-> **Note:** Install and configure [Duo Log Sync](https://github.com/duosecurity/duo_log_sync) first, following [Duo's official documentation](https://duo.com/docs/duo-log-sync). When configuring the DLS server target, point it at `127.0.0.1:9999` (TCP) — that is the address this forwarder listens on.
-
 ### Prerequisites
 
 - [Python 3.8+](https://www.python.org/downloads/) — check **"Add Python to PATH"** during install; do **not** use the Microsoft Store version
@@ -298,7 +296,62 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-### 3. Configure the forwarder
+### 3. Install Duo Log Sync
+
+Clone DLS and install it into the same venv as the forwarder — one Python environment to manage:
+
+```powershell
+git clone https://github.com/duosecurity/duo_log_sync.git C:\ProgramData\duo_log_sync
+cd C:\ProgramData\duo_log_sync
+C:\ProgramData\dls-http-collector-xdr-main\.venv\Scripts\pip install setuptools
+C:\ProgramData\dls-http-collector-xdr-main\.venv\Scripts\pip install -e .
+cd C:\ProgramData\dls-http-collector-xdr-main
+```
+
+### 4. Configure Duo Log Sync
+
+Create `C:\ProgramData\duo_log_sync\config.yml`. Fill in your Duo Admin API credentials:
+
+```yaml
+version: '1.0.0'
+
+dls_settings:
+  log_filepath: 'C:\ProgramData\duologsync\duologsync.log'
+  log_format: 'JSON'
+  api:
+    offset: 180       # Days of history to fetch on first run
+    timeout: 120      # Seconds between API polls (minimum enforced by DLS)
+  checkpointing:
+    enabled: True
+    directory: 'C:\ProgramData\duologsync\checkpoints'
+
+servers:
+  - id: 'xdr-forwarder'
+    hostname: '127.0.0.1'
+    port: 9999
+    protocol: 'TCP'
+
+account:
+  ikey: '<your-duo-integration-key>'
+  skey: '<your-duo-secret-key>'
+  hostname: '<your-duo-api-hostname>'   # e.g. api-XXXXXXXX.duosecurity.com
+
+  endpoint_server_mappings:
+    - endpoints: ['auth', 'activity']
+      server: 'xdr-forwarder'
+
+  is_msp: False
+```
+
+Create the DLS log and checkpoint directories:
+
+```powershell
+New-Item -ItemType Directory -Force "C:\ProgramData\duologsync\checkpoints"
+```
+
+> **Important:** DLS will exit immediately at startup if the checkpoint directory does not exist — it does not create it automatically.
+
+### 5. Configure the forwarder
 
 ```powershell
 Copy-Item .env.example .env
@@ -314,7 +367,7 @@ XDR_API_KEY=<your-xdr-api-key>
 
 The `DUO_IKEY`, `DUO_SKEY`, and `DUO_HOSTNAME` fields in `.env.example` are only used by `windows\setup.ps1` to generate DLS's `config.yml`. The forwarder itself never reads them — leave them blank or remove them.
 
-### 4. Test manually before deploying as a service
+### 6. Test manually before deploying as a service
 
 Open two Administrator PowerShell windows:
 
@@ -332,7 +385,7 @@ Expected output:
 
 **Window 2 — start DLS** (if not already running as a service):
 ```powershell
-<path-to-dls-venv>\Scripts\duologsync <path-to-config.yml>
+C:\ProgramData\dls-http-collector-xdr-main\.venv\Scripts\duologsync C:\ProgramData\duo_log_sync\config.yml
 ```
 
 After ~2 minutes (DLS's first API poll), the forwarder should log:
@@ -346,7 +399,7 @@ Verify records in Cortex XDR via XQL:
 dataset = duo_logs | limit 10
 ```
 
-### 5. Register as a Windows service
+### 7. Register the forwarder as a Windows service
 
 Run the following from an **Administrator** PowerShell prompt:
 
@@ -386,6 +439,47 @@ To uninstall:
 ```powershell
 nssm stop DuoXdrForwarder
 nssm remove DuoXdrForwarder confirm
+```
+
+### 8. Register DLS as a Windows service
+
+Run the following from an **Administrator** PowerShell prompt:
+
+```powershell
+$DlsDir    = "C:\ProgramData\duo_log_sync"
+$DlsExe    = "C:\ProgramData\dls-http-collector-xdr-main\.venv\Scripts\duologsync.exe"
+$ConfigYml = "$DlsDir\config.yml"
+$LogDir    = "C:\ProgramData\duo-xdr-forwarder\logs"
+
+nssm install DuoLogSync $DlsExe $ConfigYml
+nssm set DuoLogSync DisplayName      "Duo Log Sync"
+nssm set DuoLogSync Description      "Polls the Duo Admin API and forwards logs to the XDR forwarder."
+nssm set DuoLogSync Start            SERVICE_AUTO_START
+nssm set DuoLogSync AppDirectory     $DlsDir
+nssm set DuoLogSync AppStdout        "$LogDir\dls-stdout.log"
+nssm set DuoLogSync AppStderr        "$LogDir\dls-stderr.log"
+nssm set DuoLogSync AppRotateFiles   1
+nssm set DuoLogSync AppRotateBytes   10485760
+nssm set DuoLogSync DependOnService  DuoXdrForwarder
+
+nssm start DuoLogSync
+Get-Service DuoLogSync
+```
+
+`DependOnService DuoXdrForwarder` ensures DLS waits for the forwarder to be running before attempting its TCP connection to `127.0.0.1:9999`. Without it, DLS exits immediately on first start (before the forwarder is ready) and NSSM enters a restart loop.
+
+`AppDirectory` sets the working directory to the DLS clone root so DLS can locate its checkpoint files correctly.
+
+Verify DLS started correctly:
+
+```powershell
+Get-Content "$LogDir\dls-stderr.log" -Tail 20
+```
+
+To uninstall:
+```powershell
+nssm stop DuoLogSync
+nssm remove DuoLogSync confirm
 ```
 
 ---
