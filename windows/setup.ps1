@@ -129,6 +129,7 @@ function Install-NSSM {
         exit 1
     }
     winget install NSSM.NSSM --silent --accept-package-agreements --accept-source-agreements
+    Assert-LastExitCode "winget install NSSM.NSSM"
     # Reload PATH so nssm is visible without opening a new shell
     $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("PATH", "User")
@@ -185,7 +186,7 @@ function Remove-ServiceIfExists([string]$NssmPath, [string]$Name) {
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { return }
     Write-Host "    Stopping existing '$Name'..."
-    & $NssmPath stop $Name 2>$null
+    & $NssmPath stop $Name 2>$null  # exit code intentionally ignored; covers "already stopped"
     $waited = 0
     while ($waited -lt 10) {
         $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -193,6 +194,7 @@ function Remove-ServiceIfExists([string]$NssmPath, [string]$Name) {
         Start-Sleep -Seconds 1; $waited++
     }
     & $NssmPath remove $Name confirm
+    Assert-LastExitCode "nssm remove $Name"
 }
 
 # Checks $LASTEXITCODE and throws a terminating error if non-zero.
