@@ -195,6 +195,28 @@ function Remove-ServiceIfExists([string]$NssmPath, [string]$Name) {
     & $NssmPath remove $Name confirm
 }
 
+# Checks $LASTEXITCODE and throws a terminating error if non-zero.
+# Use after every native executable call (pip, git, nssm, python).
+function Assert-LastExitCode {
+    param([string]$Desc)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "$Desc failed (exit code $LASTEXITCODE). See output above and re-run."
+    }
+}
+
+# Polls a service until it reaches the Running state or the timeout elapses.
+# Returns $true if Running, $false if it timed out.
+function Wait-ServiceRunning {
+    param([string]$SvcName, [int]$TimeoutSeconds = 15)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq "Running") { return $true }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 # ---------------------------------------------------------------------------
 # Uninstall
 # ---------------------------------------------------------------------------
@@ -233,6 +255,11 @@ Write-Host "=== Duo XDR Forwarder - Windows Setup ===" -ForegroundColor Cyan
 Write-Host "Project: $ProjectDir"
 Write-Host ""
 
+# Pre-flight: NSSM does not reliably quote space-containing paths; fail early.
+if ($ProjectDir -match ' ') {
+    Write-Error "Install path contains spaces: '$ProjectDir'. Clone to a path without spaces (e.g. C:\ProgramData\) and re-run."
+}
+
 # ---------------------------------------------------------------------------
 # [1/7] Python virtual environment
 # ---------------------------------------------------------------------------
@@ -258,6 +285,7 @@ Write-Host "  Python: $systemPython"
 if (-not (Test-Path $VenvDir)) {
     Write-Host "  Creating .venv..."
     & $systemPython -m venv $VenvDir
+    Assert-LastExitCode "Python venv creation ($VenvDir)"
 } else {
     Write-Host "  .venv already exists."
 }
@@ -267,6 +295,7 @@ if (-not (Test-Path $PipExe)) {
 
 Write-Host "  Installing forwarder dependencies..."
 & $PipExe install --quiet -r (Join-Path $ProjectDir "requirements.txt")
+Assert-LastExitCode "pip install -r requirements.txt"
 Write-Host "  Done."
 
 # ---------------------------------------------------------------------------
@@ -292,8 +321,9 @@ if ($SkipDls) {
             exit 1
         }
         & $git clone --quiet https://github.com/duosecurity/duo_log_sync.git $DlsSrcDir
-        if (-not (Test-Path $DlsSrcDir)) {
-            Write-Error "git clone of duo_log_sync failed. Check your internet connection and re-run."
+        Assert-LastExitCode "git clone of duo_log_sync"
+        if (-not (Test-Path (Join-Path $DlsSrcDir "setup.py"))) {
+            Write-Error "duo_log_sync clone appears incomplete — setup.py not found. Delete '$DlsSrcDir' and re-run."
         }
         Write-Host "  Cloned duo_log_sync."
     } else {
@@ -301,12 +331,15 @@ if ($SkipDls) {
     }
 
     & $PipExe install --quiet setuptools
-    & $PipExe install --quiet -e $DlsSrcDir
+    Assert-LastExitCode "pip install setuptools"
+    & $PipExe install -e $DlsSrcDir
+    Assert-LastExitCode "pip install -e duo_log_sync ($DlsSrcDir)"
     # DLS pins Cerberus==1.3.2, which imports pkg_resources — removed in setuptools 81+.
     # Cerberus 1.3.5+ replaces it with importlib.metadata and is a drop-in replacement.
     # pip will warn about the version conflict with DLS's pin; the warning is harmless.
     Write-Host "  Applying cerberus compatibility fix (setuptools 81+ / pkg_resources)..."
-    & $PipExe install --quiet "cerberus>=1.3.5"
+    & $PipExe install "cerberus>=1.3.5"
+    Assert-LastExitCode "pip install cerberus>=1.3.5"
     Write-Host "  Installed DLS from: $DlsSrcDir"
 }
 
@@ -486,14 +519,23 @@ if (-not (Test-Path $ForwarderScript)) {
 Write-Host "  Registering '$ForwarderSvcName'..."
 Remove-ServiceIfExists $nssm $ForwarderSvcName
 & $nssm install $ForwarderSvcName $PythonExe $ForwarderScript
+Assert-LastExitCode "nssm install $ForwarderSvcName"
 & $nssm set     $ForwarderSvcName DisplayName    $ForwarderSvcDisplay
+Assert-LastExitCode "nssm set $ForwarderSvcName DisplayName"
 & $nssm set     $ForwarderSvcName Description    $ForwarderSvcDesc
+Assert-LastExitCode "nssm set $ForwarderSvcName Description"
 & $nssm set     $ForwarderSvcName Start          SERVICE_AUTO_START
+Assert-LastExitCode "nssm set $ForwarderSvcName Start"
 & $nssm set     $ForwarderSvcName AppDirectory   $ProjectDir
+Assert-LastExitCode "nssm set $ForwarderSvcName AppDirectory"
 & $nssm set     $ForwarderSvcName AppStdout      (Join-Path $LogDir "forwarder-stdout.log")
+Assert-LastExitCode "nssm set $ForwarderSvcName AppStdout"
 & $nssm set     $ForwarderSvcName AppStderr      (Join-Path $LogDir "forwarder-stderr.log")
+Assert-LastExitCode "nssm set $ForwarderSvcName AppStderr"
 & $nssm set     $ForwarderSvcName AppRotateFiles 1
+Assert-LastExitCode "nssm set $ForwarderSvcName AppRotateFiles"
 & $nssm set     $ForwarderSvcName AppRotateBytes 10485760
+Assert-LastExitCode "nssm set $ForwarderSvcName AppRotateBytes"
 
 # Pass .env variables into the service environment.
 # SECURITY NOTE: NSSM stores these values in the Windows Registry under
@@ -503,26 +545,38 @@ $envVars = Read-EnvFile $EnvFile
 if ($envVars.Count -gt 0) {
     $envString = ($envVars.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "`0"
     & $nssm set $ForwarderSvcName AppEnvironmentExtra $envString
+    Assert-LastExitCode "nssm set $ForwarderSvcName AppEnvironmentExtra"
 }
 
 # --- DLS ---
 if (-not $SkipDls) {
     if (-not (Test-Path $DlsExe)) {
-        Write-Host "  WARNING: duologsync.exe not found at $DlsExe" -ForegroundColor Yellow
-        Write-Host "           DLS service not registered. Verify Step 2 succeeded." -ForegroundColor Yellow
-    } else {
-        Write-Host "  Registering '$DlsSvcName'..."
-        Remove-ServiceIfExists $nssm $DlsSvcName
-        & $nssm install $DlsSvcName $DlsExe $DlsConfigFile
-        & $nssm set     $DlsSvcName DisplayName    $DlsSvcDisplay
-        & $nssm set     $DlsSvcName Description    $DlsSvcDesc
-        & $nssm set     $DlsSvcName Start          SERVICE_AUTO_START
-        & $nssm set     $DlsSvcName AppDirectory   $ProjectDir
-        & $nssm set     $DlsSvcName AppStdout      (Join-Path $LogDir "dls-stdout.log")
-        & $nssm set     $DlsSvcName AppStderr      (Join-Path $LogDir "dls-stderr.log")
-        & $nssm set     $DlsSvcName AppRotateFiles 1
-        & $nssm set     $DlsSvcName AppRotateBytes 10485760
+        Write-Error "duologsync.exe not found at '$DlsExe' — DLS install (Step 2) failed. Re-run to retry."
     }
+    Write-Host "  Registering '$DlsSvcName'..."
+    Remove-ServiceIfExists $nssm $DlsSvcName
+    & $nssm install $DlsSvcName $DlsExe $DlsConfigFile
+    Assert-LastExitCode "nssm install $DlsSvcName"
+    & $nssm set     $DlsSvcName DisplayName    $DlsSvcDisplay
+    Assert-LastExitCode "nssm set $DlsSvcName DisplayName"
+    & $nssm set     $DlsSvcName Description    $DlsSvcDesc
+    Assert-LastExitCode "nssm set $DlsSvcName Description"
+    & $nssm set     $DlsSvcName Start          SERVICE_AUTO_START
+    Assert-LastExitCode "nssm set $DlsSvcName Start"
+    & $nssm set     $DlsSvcName AppDirectory   $ProjectDir
+    Assert-LastExitCode "nssm set $DlsSvcName AppDirectory"
+    & $nssm set     $DlsSvcName AppStdout      (Join-Path $LogDir "dls-stdout.log")
+    Assert-LastExitCode "nssm set $DlsSvcName AppStdout"
+    & $nssm set     $DlsSvcName AppStderr      (Join-Path $LogDir "dls-stderr.log")
+    Assert-LastExitCode "nssm set $DlsSvcName AppStderr"
+    & $nssm set     $DlsSvcName AppRotateFiles 1
+    Assert-LastExitCode "nssm set $DlsSvcName AppRotateFiles"
+    & $nssm set     $DlsSvcName AppRotateBytes 10485760
+    Assert-LastExitCode "nssm set $DlsSvcName AppRotateBytes"
+    # Ensures DLS starts after the forwarder on reboot so the TCP port is already
+    # bound when DLS attempts its first connection to 127.0.0.1:9999.
+    & $nssm set     $DlsSvcName DependOnService $ForwarderSvcName
+    Assert-LastExitCode "nssm set $DlsSvcName DependOnService"
 }
 
 # ---------------------------------------------------------------------------
@@ -531,29 +585,46 @@ if (-not $SkipDls) {
 Write-Host ""
 Write-Host "Starting services..." -ForegroundColor Cyan
 & $nssm start $ForwarderSvcName
+Assert-LastExitCode "nssm start $ForwarderSvcName"
+
+Write-Host "  Waiting for $ForwarderSvcName to reach Running state (up to 15 s)..."
+$fwdOk = Wait-ServiceRunning $ForwarderSvcName 15
 
 $dlsRegistered = (-not $SkipDls) -and (Test-Path $DlsExe)
+$dlsOk = $true
+
 if ($dlsRegistered) {
-    Start-Sleep -Seconds 2
-    & $nssm start $DlsSvcName
+    if ($fwdOk) {
+        & $nssm start $DlsSvcName
+        Assert-LastExitCode "nssm start $DlsSvcName"
+        Write-Host "  Waiting for $DlsSvcName to reach Running state (up to 15 s)..."
+        $dlsOk = Wait-ServiceRunning $DlsSvcName 15
+    } else {
+        Write-Host "  Skipping DLS start — forwarder is not running." -ForegroundColor Yellow
+        $dlsOk = $false
+    }
 }
 
 # ---------------------------------------------------------------------------
 # Status report
 # ---------------------------------------------------------------------------
-Start-Sleep -Seconds 2
 $fwdSvc = Get-Service -Name $ForwarderSvcName -ErrorAction SilentlyContinue
 $dlsSvc = if ($dlsRegistered) { Get-Service -Name $DlsSvcName -ErrorAction SilentlyContinue } else { $null }
+$allOk  = $fwdOk -and $dlsOk
 
 Write-Host ""
-Write-Host "=== Setup Complete ===" -ForegroundColor Green
+if ($allOk) {
+    Write-Host "=== Setup Complete ===" -ForegroundColor Green
+} else {
+    Write-Host "=== Setup Incomplete ===" -ForegroundColor Red
+}
 Write-Host ""
 
-$fwdColor = if ($fwdSvc -and $fwdSvc.Status -eq "Running") { "Green" } else { "Yellow" }
+$fwdColor = if ($fwdOk) { "Green" } else { "Red" }
 Write-Host "  $ForwarderSvcName : $(if ($fwdSvc) { $fwdSvc.Status } else { 'unknown' })" -ForegroundColor $fwdColor
 
 if ($dlsRegistered) {
-    $dlsColor = if ($dlsSvc -and $dlsSvc.Status -eq "Running") { "Green" } else { "Yellow" }
+    $dlsColor = if ($dlsOk) { "Green" } else { "Red" }
     Write-Host "  $DlsSvcName       : $(if ($dlsSvc) { $dlsSvc.Status } else { 'unknown' })" -ForegroundColor $dlsColor
 } elseif ($SkipDls) {
     Write-Host "  $DlsSvcName       : skipped (-SkipDls)" -ForegroundColor Gray
@@ -562,6 +633,21 @@ if ($dlsRegistered) {
 Write-Host ""
 Write-Host "  Logs : $LogDir"
 Write-Host ""
+
+if (-not $allOk) {
+    $failedName   = if (-not $fwdOk) { $ForwarderSvcName } else { $DlsSvcName }
+    $failedStderr = if (-not $fwdOk) {
+        Join-Path $LogDir "forwarder-stderr.log"
+    } else {
+        Join-Path $LogDir "dls-stderr.log"
+    }
+    Write-Host "  '$failedName' did not reach Running state within 15 s." -ForegroundColor Red
+    Write-Host "  Check the log for the crash reason:" -ForegroundColor Red
+    Write-Host "    Get-Content '$failedStderr' -Tail 20" -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+
 Write-Host "NOTE: XDR API key is stored in the Windows Registry (NSSM AppEnvironmentExtra)." -ForegroundColor Yellow
 Write-Host "      Restrict the registry ACL to SYSTEM + Administrators after install." -ForegroundColor Yellow
 Write-Host ""
